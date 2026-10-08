@@ -1,0 +1,138 @@
+# fisch-macro configuration.
+# `cargo run --release -- calibrate` rewrites the [layout] and [colors] sections;
+# everything else is yours to tune. Coordinates are screen pixels as printed by
+# `hyprctl cursorpos`.
+
+[window]
+# Window class of Roblox (check with `hyprctl clients`).
+class = "org.vinegarhq.Sober"
+# Re-focus the game before every cast if something else has focus.
+refocus = true
+# Where the cursor is parked while fishing (over open water, away from UI).
+cursor_x = 1280
+cursor_y = 500
+# How to talk to `hyprctl dispatch`: "auto", "legacy" (hyprland.conf) or "lua" (hyprland.lua).
+dispatch_style = "auto"
+
+[capture]
+# "auto" benchmarks both backends at startup and keeps the faster one,
+# "screencopy" (wlr-screencopy, in-process) or "grim" (spawns grim per frame).
+backend = "auto"
+# Output name for screencopy (e.g. "DP-3"); empty = the output that contains the bar.
+output = ""
+# Give up on a frame after this long.
+frame_timeout_ms = 500
+
+[layout]
+# Reel track (the moving-bar area), inclusive screen coordinates.
+track_left = 0
+track_top = 0
+track_right = 0
+track_bottom = 0
+# Progress bar row under the track. progress_y = 0 disables progress reading.
+# progress_left/right = 0 means "same as the track".
+progress_y = 0
+progress_left = 0
+progress_right = 0
+# Extra pixels captured around everything above.
+padding = 6
+
+[colors]
+# Reference colours sampled by `calibrate` during a real Ruinous Oath minigame.
+# A pixel matches when its RGB distance to ANY listed colour is <= the tolerance.
+bar = []
+fish = []
+progress = []
+bar_tolerance = 45.0
+fish_tolerance = 40.0
+progress_tolerance = 45.0
+
+[detection]
+# Rows sampled across the middle `row_band` fraction of the track height.
+row_samples = 5
+row_band = 0.6
+# A column counts as bar/fish when this fraction of the sampled rows match
+# (makes slash effects and particles that only cover part of the height harmless).
+column_min_fraction = 0.4
+# Bar width limits: pixels for the minimum, fraction of the track for the maximum.
+bar_min_width = 3
+bar_max_width = 0.7
+# Bar segments separated by at most this many pixels (the fish drawn over the bar)
+# are merged into one bar.
+bar_merge_gap = 40
+fish_min_width = 2
+fish_max_width = 70
+# A fish detection further than this (fraction of the track width) from the
+# predicted position must be seen twice in a row before it is believed.
+fish_max_jump = 0.2
+# Frames in a row with bar + fish visible before the minigame counts as started.
+start_frames = 3
+# The minigame is over once neither bar nor fish has been seen for end_ms,
+# or the fish alone has been missing for fish_lost_end_ms.
+end_ms = 500
+fish_lost_end_ms = 2000
+# A progress decrease larger than this (fraction of the bar) counts as a "drop".
+progress_drop = 0.03
+
+[controller]
+# "pd": PD controller -> duty cycle -> sigma-delta hold/release (recommended).
+# "bang_bang": hold whenever error + (kd/kp) * error_rate > 0.
+mode = "pd"
+# Gains act on errors measured in track widths (resolution independent).
+# kp: how hard to chase the fish. kd: damping, counters the bar's momentum.
+kp = 9.0
+kd = 2.1
+# Hold duty that keeps the bar still (0.5 = holding and releasing are equally strong).
+neutral_duty = 0.5
+# How far past each frame to predict the fish and the bar. Covers capture
+# latency + one 60 Hz frame + input latency. Raise it if the bar lags behind.
+lookahead_ms = 50.0
+# Frames used to estimate fish speed/acceleration (quadratic fit).
+fish_history = 5
+# 0 = ignore fish acceleration, 1 = trust it fully.
+fish_accel_weight = 0.5
+# Frames used to estimate the bar's speed (linear fit).
+bar_history = 3
+# Safety margin as a fraction of the bar half-width: when the predicted fish gets
+# this close to a bar edge and is moving outwards, the controller saturates.
+edge_guard = 0.3
+# Keep predicting from the last estimate for this long when the fish or bar is
+# hidden by an effect.
+coast_ms = 150.0
+
+[timing]
+focus_delay_ms = 300
+# How long LMB is held to charge the cast.
+cast_hold_ms = 1000
+# Wait after releasing the cast before UI navigation + Enter spam starts.
+after_cast_ms = 1200
+enter_interval_ms = 90
+key_press_ms = 25
+# Recast when no minigame appeared within this time.
+shake_timeout_ms = 30000
+reel_timeout_ms = 120000
+# Pause after a minigame ends (catch popup / animation).
+after_catch_ms = 2200
+recover_delay_ms = 1500
+# Time for Hyprland to pick up the virtual mouse/keyboard after they are created.
+input_settle_ms = 700
+
+[keys]
+# Linux key names (KEY_BACKSLASH, KEY_ENTER, KEY_1, ...). On a non-US layout use the
+# key that sits where \ is on a US keyboard, e.g. "KEY_102ND" or "KEY_BACKSLASH".
+nav_toggle = "KEY_BACKSLASH"
+shake = "KEY_ENTER"
+# Press nav_toggle after every cast (and again once the shake phase ends).
+# Set false if you keep UI navigation on all the time.
+toggle_nav_each_cast = true
+# When to turn UI navigation back off: "reel_start" or "reel_end".
+nav_off = "reel_start"
+# Hotbar key of the rod (e.g. "KEY_1"). If set, the rod is unequipped and
+# re-equipped after a timeout to cancel a stuck cast. Empty = disabled.
+reequip = ""
+
+[logging]
+# Per-catch stats for tuning (empty = disabled).
+catches_csv = "catches.csv"
+# Print one line per frame during the reel.
+verbose_reel = false

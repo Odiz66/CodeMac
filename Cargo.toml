@@ -1,0 +1,26 @@
+[package]
+name = "fisch-macro"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "AFK fishing macro for Roblox Fisch (Sober) on Hyprland / Wayland"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+evdev = "0.13.2"
+png = "0.18.1"
+rustix = { version = "1.1.5", features = ["event", "fs"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+signal-hook = "0.4.5"
+toml = { version = "1.1.7", default-features = false, features = ["std", "serde", "parse"] }
+wayland-client = "0.31.15"
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+
+[profile.release]
+opt-level = 3
+# Keep line numbers in panic backtraces.
+debug = "line-tables-only"
