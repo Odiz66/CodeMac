@@ -13,7 +13,8 @@ use anyhow::{Context, Result, anyhow};
 use evdev::KeyCode;
 
 use crate::capture::{self, Capturer, Frame, Rect};
-use crate::config::{Config, NavOff};
+use crate::cast::{CastBar, CastWatch};
+use crate::config::{CastMode, Config, NavOff};
 use crate::detect::Detector;
 use crate::hypr::Hypr;
 use crate::input::{Input, parse_key};
@@ -54,6 +55,9 @@ struct Totals {
     lost: u32,
     shake_timeouts: u32,
     reel_timeouts: u32,
+    /// Casts released by watching the power bar / after max_hold_ms.
+    bar_casts: u32,
+    fallback_casts: u32,
 }
 
 struct Keys {
@@ -70,6 +74,7 @@ struct Macro {
     cap: Box<dyn Capturer>,
     det: Detector,
     rect: Rect,
+    cast_bar: Option<CastBar>,
     keys: Keys,
     nav_on: bool,
     pending_key: Option<(KeyCode, Instant)>,
@@ -90,6 +95,17 @@ pub fn run(cfg: Config, start: bool, verbose: bool, dry_run: bool) -> Result<()>
         } else {
             Some(parse_key(&cfg.keys.reequip)?)
         },
+    };
+
+    let cast_bar = match cfg.cast.mode {
+        CastMode::Timed => None,
+        CastMode::Auto => CastBar::new(&cfg.cast),
+        CastMode::Perfect => Some(CastBar::new(&cfg.cast).ok_or_else(|| {
+            anyhow!(
+                "cast.mode = \"perfect\" but the power bar is not calibrated; \
+                 run `cargo run --release -- calibrate --only cast`"
+            )
+        })?),
     };
 
     let hypr = Hypr::connect(cfg.window.dispatch_style)?;
@@ -139,6 +155,10 @@ pub fn run(cfg: Config, start: bool, verbose: bool, dry_run: bool) -> Result<()>
 
     let csv = open_csv(&cfg.logging.catches_csv)?;
     let verbose = verbose || cfg.logging.verbose_reel;
+    match &cast_bar {
+        Some(b) => log!("Casting: perfect (watching the power bar at {})", b.rect),
+        None => log!("Casting: timed ({} ms hold)", cfg.timing.cast_hold_ms),
+    }
     let mut m = Macro {
         cfg,
         hypr,
@@ -147,6 +167,7 @@ pub fn run(cfg: Config, start: bool, verbose: bool, dry_run: bool) -> Result<()>
         cap,
         det,
         rect,
+        cast_bar,
         keys,
         nav_on: false,
         pending_key: None,
@@ -177,8 +198,8 @@ fn open_csv(path: &str) -> Result<Option<File>> {
         writeln!(
             f,
             "elapsed_s,outcome,perfect,duration_s,frames,measured,outside_frames,longest_outside_frames,\
-             worst_outside_px,min_margin_px,progress_drops,final_progress,guard_frames,hold_ratio,mode,kp,kd,\
-             lookahead_ms,edge_guard,end_reason"
+             worst_outside_px,min_margin_px,progress_drops,final_progress,guard_frames,hold_ratio,frame_ms,\
+             mode,kp,kd,lookahead_ms,lookahead_frames,edge_guard,end_reason"
         )?;
     }
     Ok(Some(f))
@@ -319,9 +340,13 @@ impl Macro {
     }
 
     fn grab(&mut self) -> Result<Frame> {
+        self.grab_rect(self.rect)
+    }
+
+    fn grab_rect(&mut self, rect: Rect) -> Result<Frame> {
         let mut failures = 0;
         loop {
-            match self.cap.grab(self.rect) {
+            match self.cap.grab(rect) {
                 Ok(f) => return Ok(f),
                 Err(e) => {
                     failures += 1;
@@ -364,10 +389,61 @@ impl Macro {
         self.input.set_lmb(false)?;
         self.input.wiggle()?;
         self.input.set_lmb(true)?;
-        self.sleep(self.cfg.timing.cast_hold_ms)?;
+        let how = match self.cast_bar.take() {
+            Some(bar) => {
+                let result = self.charge(&bar);
+                self.cast_bar = Some(bar);
+                result?
+            }
+            None => {
+                self.sleep(self.cfg.timing.cast_hold_ms)?;
+                "timed".to_string()
+            }
+        };
         self.input.set_lmb(false)?;
-        log!("Cast #{}", self.totals.casts);
+        log!("Cast #{} ({how})", self.totals.casts);
         self.sleep(self.cfg.timing.after_cast_ms)
+    }
+
+    /// Holds the button while watching the power bar; returns how it ended.
+    fn charge(&mut self, bar: &CastBar) -> Result<String> {
+        let mut watch = CastWatch::new(&self.cfg.cast);
+        let start = Instant::now();
+        let max = Duration::from_millis(self.cfg.cast.max_hold_ms);
+        loop {
+            self.check()?;
+            let frame = self.grab_rect(bar.rect)?;
+            let fill = bar.fill(&frame);
+            let t = frame
+                .received
+                .saturating_duration_since(start)
+                .as_secs_f64();
+            if watch.update(t, fill) {
+                self.totals.bar_casts += 1;
+                return Ok(format!(
+                    "power bar {:.0}% after {} ms",
+                    fill * 100.0,
+                    start.elapsed().as_millis()
+                ));
+            }
+            if start.elapsed() >= max {
+                self.totals.fallback_casts += 1;
+                return Ok(if watch.peak() < 0.05 {
+                    paint(
+                        "power bar not seen - released after max_hold_ms; check `debug --cast`",
+                        "33",
+                    )
+                } else {
+                    paint(
+                        &format!(
+                            "power bar peaked at {:.0}% (< release_at) - released after max_hold_ms",
+                            watch.peak() * 100.0
+                        ),
+                        "33",
+                    )
+                });
+            }
+        }
     }
 
     fn shake(&mut self) -> Result<Shake> {
@@ -381,6 +457,10 @@ impl Macro {
         let timeout = Duration::from_millis(self.cfg.timing.shake_timeout_ms);
         let mut last_enter: Option<Instant> = None;
         let mut last_focus_check = Instant::now();
+        let refresh = Duration::from_millis(self.cfg.keys.nav_refresh_ms);
+        let mut last_refresh = Instant::now();
+        // Set while UI navigation is briefly off during a refresh.
+        let mut nav_back_on: Option<Instant> = None;
         let mut streak = 0;
         loop {
             self.check()?;
@@ -406,6 +486,27 @@ impl Macro {
             if self.pending_key.is_none() && last_enter.is_none_or(|t| t.elapsed() >= interval) {
                 self.press_async(self.keys.shake)?;
                 last_enter = Some(Instant::now());
+            }
+            // Optional: switch UI navigation off and on again so the newest
+            // shake button gets selected.
+            if !refresh.is_zero()
+                && self.cfg.keys.toggle_nav_each_cast
+                && self.pending_key.is_none()
+            {
+                match nav_back_on {
+                    Some(at) if Instant::now() >= at => {
+                        self.press_async(self.keys.nav)?;
+                        self.nav_on = true;
+                        nav_back_on = None;
+                        last_refresh = Instant::now();
+                    }
+                    None if self.nav_on && last_refresh.elapsed() >= refresh => {
+                        self.press_async(self.keys.nav)?;
+                        self.nav_on = false;
+                        nav_back_on = Some(Instant::now() + Duration::from_millis(100));
+                    }
+                    _ => {}
+                }
             }
             if start.elapsed() > timeout {
                 return Ok(Shake::Timeout);
@@ -519,10 +620,11 @@ impl Macro {
             .last_progress
             .map_or("n/a".into(), |p| format!("{:.0}%", p * 100.0));
         let summary = format!(
-            "{:.1} s, fish in bar {:.1}% of {} frames, min margin {:+.1} px, progress {}",
+            "{:.1} s, fish in bar {:.1}% of {} frames @ {:.0} fps, min margin {:+.1} px, progress {}",
             s.duration_s,
             s.inside_ratio() * 100.0,
             s.measured,
+            1000.0 / s.frame_ms.max(0.1),
             s.min_margin_px,
             progress
         );
@@ -580,7 +682,7 @@ impl Macro {
             let c = &self.cfg.controller;
             let _ = writeln!(
                 f,
-                "{:.1},{outcome},{},{:.2},{},{},{},{},{:.1},{:.1},{},{},{},{:.3},{:?},{},{},{},{},{:?}",
+                "{:.1},{outcome},{},{:.2},{},{},{},{},{:.1},{:.1},{},{},{},{:.3},{:.2},{:?},{},{},{},{},{},{:?}",
                 self.started.elapsed().as_secs_f64(),
                 s.perfect(),
                 s.duration_s,
@@ -594,10 +696,12 @@ impl Macro {
                 s.last_progress.map_or(String::new(), |p| format!("{p:.3}")),
                 s.guard_frames,
                 s.hold_frames as f32 / s.frames.max(1) as f32,
+                s.frame_ms,
                 c.mode,
                 c.kp,
                 c.kd,
                 c.lookahead_ms,
+                c.lookahead_frames,
                 c.edge_guard,
                 reason,
             );
@@ -628,8 +732,11 @@ impl Macro {
         let t = &self.totals;
         println!();
         log!(
-            "Session: {} casts, {} minigames, {} catches ({} perfect), {} lost, {} shake timeouts, {} reel timeouts.",
+            "Session: {} casts ({} by power bar, {} fallback), {} minigames, {} catches ({} perfect), {} lost, \
+             {} shake timeouts, {} reel timeouts.",
             t.casts,
+            t.bar_casts,
+            t.fallback_casts,
             t.minigames,
             t.catches,
             t.perfect,

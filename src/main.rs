@@ -4,6 +4,7 @@
 
 mod calibrate;
 mod capture;
+mod cast;
 mod config;
 mod controller;
 mod debug;

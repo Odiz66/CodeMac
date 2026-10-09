@@ -5,9 +5,10 @@ AFK fishing macro for the Roblox game **Fisch**, written in Rust for
 from calibration, detection tolerates the rod's effects, and the reel
 controller aims for perfect catches (Mastered mutation).
 
-Loop: focus Sober → cast (hold LMB) → UI navigation `\` + Enter until the
-reel minigame appears → PD controller with prediction keeps the fish in your
-bar → wait until the minigame disappears → log the catch → recast.
+Loop: focus Sober → cast (hold LMB, released at the top of the power bar) →
+UI navigation `\` + Enter until the reel minigame appears → PD controller
+with prediction keeps the fish in your bar → wait until the minigame
+disappears → log the catch → recast.
 
 | Piece | How |
 |---|---|
@@ -61,19 +62,40 @@ bind = , F6, exec, pkill -USR1 -x fisch-macro
 bind = SHIFT, F6, exec, pkill -TERM -x fisch-macro; sleep 1; pkill -KILL -x fisch-macro
 ```
 
-`hyprland.lua`:
+`hyprland.lua` (if it only contains `require("config.…")` lines, as on CachyOS,
+the binds belong in `~/.config/hypr/config/binds.lua`). These commands add
+them:
 
-```lua
-hl.bind("F6", hl.dsp.exec_cmd("pkill -USR1 -x fisch-macro"))
-hl.bind("SHIFT + F6", hl.dsp.exec_cmd("pkill -TERM -x fisch-macro; sleep 1; pkill -KILL -x fisch-macro"))
+```fish
+echo 'hl.bind("F6", hl.dsp.exec_cmd("pkill -USR1 -x fisch-macro"))' >> ~/.config/hypr/config/binds.lua
+echo 'hl.bind("SHIFT + F6", hl.dsp.exec_cmd("pkill -TERM -x fisch-macro; sleep 1; pkill -KILL -x fisch-macro"))' >> ~/.config/hypr/config/binds.lua
 ```
 
 Reload with `hyprctl reload`. Even a hard kill cannot leave the button held:
 the kernel removes the virtual mouse with the process, and its pressed button
 goes with it.
 
+### Monitor refresh rate
+
+Every capture waits for the next screen refresh, so a faster monitor means
+fresher frames and better tracking. Your MSI G272QPF does 170 Hz; in the
+simulation a hard fish goes from ~98% to ~100% fish-in-bar when moving from
+60 Hz to 170 Hz. Check the offered modes, set it and verify:
+
+```fish
+hyprctl monitors all | grep -i availablemodes
+echo 'hl.monitor({ output = "DP-3", mode = "2560x1440@170", position = "0x0", scale = 1 })' >> ~/.config/hypr/config/monitors.lua
+hyprctl reload
+hyprctl monitors | grep @
+```
+
+The prediction scales with the measured capture rate by itself
+(`lookahead_frames`), so no config change is needed when you switch.
+
 ### In-game settings
 
+- **FPS cap 240** (what you use) is good: the game then reacts to a click
+  within ~4 ms instead of ~17 ms at 60 FPS.
 - **Higher Brightness** and **Higher Saturation**: turn both **off**. They
   push the minigame colours together. If you change any of these later, run
   calibration again.
@@ -82,7 +104,11 @@ goes with it.
 - **Bait**: calibrate with the bait you will actually use. If a bait tints or
   animates the minigame and detection struggles, use a plainer one.
 - **UI Navigation Toggle** is `\` and must be **off** when you start the
-  macro. The macro turns it on for the shake and off again afterwards.
+  macro. The macro turns it on for the shake and off again afterwards. With the
+  Polish (programmer's) layout `\` is on the same key as on a US keyboard, so
+  the default `KEY_BACKSLASH` is right.
+- The rod is expected in **hotbar slot 1** (`keys.reequip = "KEY_1"`): after a
+  timeout it is unequipped and re-equipped to cancel a stuck cast.
 - Keep Sober fullscreen at the same resolution. If you change the resolution,
   UI scale or window mode, the bar moves and you need to recalibrate.
 - Keep screen shaders, hyprsunset/night light and HDR the same as during
@@ -109,13 +135,19 @@ not affect it.
    dominant track colour, and the fish is the most common narrow full-height
    object that is neither. The progress colour comes from the left end of the
    progress bar.
+6. Power bar (perfect cast): while charging a cast, hover the **empty end** of
+   the power bar, then its **full end**.
+7. Let go; when the countdown ends, **press and hold** to charge a cast for
+   3 s. The fill colour is learned from that recording, and the fill over time
+   is printed so you can see whether it reached 100%.
 
 Everything is written to `config.toml`, and the frames go to `calibration/`.
 `calibration/frame_000_ann.png` shows what was detected: green lines at the
 bar edges, red at the fish, yellow track outline.
 
-Redo a part with `--only region` / `--only colors`, or skip progress with
-`--no-progress`.
+Redo a part with `--only region` / `--only colors` / `--only cast`, skip
+progress with `--no-progress` or the power bar with `--no-cast`. Without a
+calibrated power bar the macro falls back to holding for `timing.cast_hold_ms`.
 
 **Manual colour picking** (e.g. the fish was missed): open a saved PNG in an
 image viewer, note pixel coordinates, then run:
@@ -124,8 +156,9 @@ image viewer, note pixel coordinates, then run:
 cargo run --release -- calibrate --png calibration/frame_012.png --fish 512,20 --fish 530,22 --append
 ```
 
-`--bar X,Y` and `--progress X,Y` work the same way. Without `--append` the
-list is replaced.
+`--bar X,Y`, `--progress X,Y` and `--cast-fill X,Y` (on a
+`calibration/cast_*.png`) work the same way. Without `--append` the list is
+replaced.
 
 ## 3. Check detection
 
@@ -133,7 +166,14 @@ list is replaced.
 cargo run --release -- debug            # live view, never touches the mouse
 cargo run --release -- debug --bench    # screencopy vs grim speed
 cargo run --release -- debug --full     # full screenshot with regions drawn on it
+cargo run --release -- debug --cast     # power bar fill while you charge casts by hand
 ```
+
+`debug --cast` prints the fill every frame and marks `<-- RELEASE` where the
+macro would let go. Charge a few casts by hand: if the game shows a perfect
+cast when you release at that moment, the timing is right. Otherwise adjust
+`cast.release_at` (where to release) or `cast.lead_ms` (how early, to cover
+latency).
 
 `debug` prints a line per frame (interval, FPS, bar, fish, inside/outside +
 margin, progress) and saves raw + annotated PNGs to `debug/` every 30 frames.
@@ -171,7 +211,8 @@ navigation is turned back off if the game is focused.
 Every catch is logged:
 
 ```
-[00:12:31] Catch #14 PERFECT (7.9 s, fish in bar 100.0% of 470 frames, min margin +3.5 px, progress 100%) | perfect 12/14 (86%)
+[00:12:30] Cast #15 (power bar 97% after 1130 ms)
+[00:12:31] Catch #14 PERFECT (7.9 s, fish in bar 100.0% of 1340 frames @ 170 fps, min margin +3.5 px, progress 100%) | perfect 12/14 (86%)
 [00:13:02] Catch #15 not perfect: fish outside the bar in 4 frames (longest 3 in a row, worst 6.0 px) (...)
 ```
 
@@ -183,12 +224,12 @@ and appended to `catches.csv` for tuning.
 never went down. The last ~0.1 s are ignored because that is the catch
 animation.
 
-The game only shows a new frame every 16.7 ms (60 Hz), and each frame is
-already 1-2 frames old when it is captured. A click then takes about one more
-frame to act. The controller therefore **predicts** the fish (a quadratic fit
-over the last frames, so speed + acceleration) and the bar (speed)
-`lookahead_ms` into the future. It drives a PD law on that error, in track
-widths:
+Captures only arrive once per screen refresh (every 16.7 ms at 60 Hz, 5.9 ms
+at 170 Hz), each one is already a little old, and a click takes a few more
+milliseconds to act. The controller therefore **predicts** the fish (a
+quadratic fit over the last frames, so speed + acceleration) and the bar
+(speed) `lookahead_ms + lookahead_frames × frame interval` into the future.
+It drives a PD law on that error, in track widths:
 
 ```
 duty = neutral_duty + kp * error + kd * (fish speed - bar speed)
@@ -206,17 +247,17 @@ where it goes wrong.
 
 | Symptom | Change |
 |---|---|
-| Bar trails behind the fish and loses it on the trailing side | `lookahead_ms` +10, or `kp` +2 |
-| Bar overshoots and the fish leaves on alternating sides | `kd` +0.3, or `kp` -2 |
+| Bar trails behind the fish and loses it on the trailing side | `lookahead_frames` +0.25 (or `lookahead_ms` +5), or `kp` +3 |
+| Bar overshoots and the fish leaves on alternating sides | `kd` +0.5, or `kp` -3 |
 | Bar drifts while the fish is still (stun) | `neutral_duty`: raise it if the bar drifts left, lower it if it drifts right |
 | Fish escapes on sudden direction changes | `edge_guard` 0.3 → 0.45, `fish_accel_weight` → 0.7, `fish_history` 5 → 4 |
 | Jittery hold pattern from noisy detection | `fish_history` 5 → 6, check colours in `debug` |
-| Capture below 60 fps (`debug --bench`) | use the faster backend, raise `lookahead_ms` |
+| Capture slower than the refresh rate (`debug --bench`) | use the faster backend, raise `lookahead_ms` |
 
 `mode = "bang_bang"` (hold whenever `kp*error + kd*speed > 0`) is there to
-compare against. The defaults (`kp 9, kd 2.1, lookahead 50 ms`) were chosen
-in a simulation (`cargo test sim`). Fisch's real physics may differ, so tune
-on the real game.
+compare against. The defaults (`kp 20, kd 3, lookahead 1.75 frames`) were
+chosen in a simulation of a 240 FPS game on 60 Hz and 170 Hz screens (`cargo
+test sim`). Fisch's real physics may differ, so tune on the real game.
 
 ## 6. Troubleshooting
 
@@ -231,8 +272,11 @@ on the real game.
 | Slash effects cause false fish | Raise `detection.column_min_fraction` (0.4 → 0.6). |
 | Fish and bar get mixed up | Their colours are too close: lower `bar_tolerance` / `fish_tolerance`. |
 | Minigame "ends" too early or too late | `detection.end_ms` (no bar + no fish) and `detection.fish_lost_end_ms`. |
-| Enter presses the wrong button (rod unequipped, menus) | Raise `timing.after_cast_ms` so navigation starts after the shake button exists. Set `keys.reequip = "KEY_1"` (rod slot) to recover after timeouts. |
-| Casts are too weak or too strong | `timing.cast_hold_ms`. |
+| Enter presses the wrong button (rod unequipped, menus) | Raise `timing.after_cast_ms` so navigation starts after the shake button exists. `keys.reequip` (rod slot, default `KEY_1`) recovers after timeouts. |
+| Only the first shake button gets pressed | Set `keys.nav_refresh_ms = 1500`: UI navigation is switched off and on every 1.5 s so the newest button is selected. |
+| Cast released too early / too late | Check with `debug --cast`, then adjust `cast.release_at` / `cast.lead_ms`. |
+| "power bar not seen" in the cast log | Recalibrate with `calibrate --only cast`; `debug --full` shows where it looks (orange line). |
+| Timed casts (no power bar) too weak or too strong | `timing.cast_hold_ms`. |
 | Recasts while the catch popup is still shown | Raise `timing.after_catch_ms`. |
 | Wrong screen coordinates | `debug --full` draws the configured regions on a screenshot. |
 
@@ -242,6 +286,7 @@ on the real game.
 src/main.rs           CLI (run / calibrate / debug)
 src/run.rs            fishing loop: focus, cast, shake, reel, recover, stats
 src/reel.rs           per-minigame logic: tracking, gating, end detection, perfect stats
+src/cast.rs           power bar reading + release timing for perfect casts
 src/controller.rs     PD + sigma-delta hold/release
 src/tracker.rs        least-squares motion estimation
 src/detect.rs         bar/fish/progress detection

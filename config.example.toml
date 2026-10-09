@@ -1,7 +1,7 @@
 # fisch-macro configuration.
-# `cargo run --release -- calibrate` rewrites the [layout] and [colors] sections;
-# everything else is yours to tune. Coordinates are screen pixels as printed by
-# `hyprctl cursorpos`.
+# `cargo run --release -- calibrate` rewrites [layout], [colors] and the power-bar
+# part of [cast]; everything else is yours to tune. Coordinates are screen
+# pixels as printed by `hyprctl cursorpos`.
 
 [window]
 # Window class of Roblox (check with `hyprctl clients`).
@@ -80,13 +80,17 @@ progress_drop = 0.03
 mode = "pd"
 # Gains act on errors measured in track widths (resolution independent).
 # kp: how hard to chase the fish. kd: damping, counters the bar's momentum.
-kp = 9.0
-kd = 2.1
+kp = 20.0
+kd = 3.0
 # Hold duty that keeps the bar still (0.5 = holding and releasing are equally strong).
 neutral_duty = 0.5
-# How far past each frame to predict the fish and the bar. Covers capture
-# latency + one 60 Hz frame + input latency. Raise it if the bar lags behind.
-lookahead_ms = 50.0
+# How far past each frame to predict the fish and the bar:
+#   lookahead_ms + lookahead_frames * (measured time between captured frames)
+# It covers capture latency, the wait for the next frame and input latency, and
+# scales by itself with the monitor refresh rate (60 Hz vs 170 Hz).
+# Raise it if the bar lags behind the fish.
+lookahead_ms = 0.0
+lookahead_frames = 1.75
 # Frames used to estimate fish speed/acceleration (quadratic fit).
 fish_history = 5
 # 0 = ignore fish acceleration, 1 = trust it fully.
@@ -100,9 +104,28 @@ edge_guard = 0.3
 # hidden by an effect.
 coast_ms = 150.0
 
+[cast]
+# "perfect": watch the power bar while charging and release at the top.
+# "timed": hold for timing.cast_hold_ms. "auto": perfect once the bar is calibrated.
+mode = "auto"
+# Screen points at the empty end and at the full end of the power bar
+# (`calibrate --only cast` sets them and the fill colours).
+empty_x = 0
+empty_y = 0
+full_x = 0
+full_y = 0
+fill = []
+tolerance = 45.0
+# Release once the predicted fill reaches this fraction of the bar.
+release_at = 0.96
+# Release this much earlier to cover capture + input latency.
+lead_ms = 20.0
+# Release anyway after this long (bar not visible / never reached release_at).
+max_hold_ms = 3000
+
 [timing]
 focus_delay_ms = 300
-# How long LMB is held to charge the cast.
+# How long LMB is held to charge a "timed" cast.
 cast_hold_ms = 1000
 # Wait after releasing the cast before UI navigation + Enter spam starts.
 after_cast_ms = 1200
@@ -127,9 +150,12 @@ shake = "KEY_ENTER"
 toggle_nav_each_cast = true
 # When to turn UI navigation back off: "reel_start" or "reel_end".
 nav_off = "reel_start"
-# Hotbar key of the rod (e.g. "KEY_1"). If set, the rod is unequipped and
-# re-equipped after a timeout to cancel a stuck cast. Empty = disabled.
-reequip = ""
+# If Enter stops pressing new shake buttons, set this to e.g. 1500: UI navigation
+# is then switched off and on again every 1.5 s to re-select the button. 0 = off.
+nav_refresh_ms = 0
+# Hotbar key of the rod. After a timeout the rod is unequipped and re-equipped
+# to cancel a stuck cast. Empty = disabled.
+reequip = "KEY_1"
 
 [logging]
 # Per-catch stats for tuning (empty = disabled).

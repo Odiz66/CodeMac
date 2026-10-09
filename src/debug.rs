@@ -11,12 +11,13 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::capture::{self, Capturer, Frame, Grim, Rect, Screencopy};
+use crate::cast::{CastBar, CastWatch};
 use crate::config::Config;
 use crate::detect::{Detector, Layout};
 use crate::hypr::Hypr;
 use crate::img::save_png;
 use crate::reel::Reel;
-use crate::signals;
+use crate::signals::{self, Flags};
 use crate::util::paint;
 
 #[derive(Debug, clap::Args)]
@@ -42,12 +43,19 @@ pub struct Args {
     /// Save a full-screen screenshot with the configured regions drawn on it, then exit.
     #[arg(long)]
     full: bool,
+    /// Watch the cast power bar instead: charge casts by hand and see the fill
+    /// and when the macro would release.
+    #[arg(long)]
+    cast: bool,
 }
 
 pub fn debug(cfg: Config, args: Args) -> Result<()> {
     let flags = signals::install(true)?;
     if args.full {
         return full_screenshot(&cfg, &args.out);
+    }
+    if args.cast {
+        return watch_cast(&cfg, &flags, args.frames);
     }
     let layout = Layout::from_config(&cfg.layout)?;
     let rect = layout.capture;
@@ -341,6 +349,16 @@ fn full_screenshot(cfg: &Config, out: &Path) -> Result<()> {
     } else {
         println!("The reel bar is not calibrated yet; only the cursor park point is drawn.");
     }
+    if let Some(bar) = CastBar::new(&cfg.cast) {
+        for (x, y) in bar.screen_points() {
+            let (x, y) = to_local(x, y);
+            for k in -1..=1 {
+                if x + k >= 0 && y >= 0 {
+                    ann.set((x + k) as u32, y as u32, [255, 128, 0]);
+                }
+            }
+        }
+    }
     let (cx, cy) = to_local(cfg.window.cursor_x, cfg.window.cursor_y);
     for d in -12..=12 {
         for w in -1..=1 {
@@ -355,7 +373,55 @@ fn full_screenshot(cfg: &Config, out: &Path) -> Result<()> {
     save_png(&ann_path, &ann)?;
     println!("Saved {} and {}", raw_path.display(), ann_path.display());
     println!(
-        "magenta = capture region, yellow = reel track, cyan = progress row, green cross = cursor park point"
+        "magenta = capture region, yellow = reel track, cyan = progress row, orange = cast power bar, \
+         green cross = cursor park point"
     );
+    Ok(())
+}
+
+/// `debug --cast`: prints the power bar fill while you charge casts by hand.
+fn watch_cast(cfg: &Config, flags: &Flags, frames: u64) -> Result<()> {
+    let bar = CastBar::new(&cfg.cast).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the power bar is not calibrated; run `cargo run --release -- calibrate --only cast`"
+        )
+    })?;
+    let mut cap = capture::open(&cfg.capture, Some(bar.rect))?;
+    println!(
+        "Watching the power bar at {}. Charge casts by hand; Ctrl+C to stop.",
+        bar.rect
+    );
+    println!("\"RELEASE\" marks the frame where the macro would let go.");
+    let mut watch: Option<(CastWatch, Instant, bool)> = None;
+    let mut n = 0u64;
+    while !flags.quitting() && (frames == 0 || n < frames) {
+        let frame = cap.grab(bar.rect)?;
+        n += 1;
+        let fill = bar.fill(&frame);
+        if fill > 0.05 && watch.is_none() {
+            watch = Some((CastWatch::new(&cfg.cast), frame.received, false));
+            println!("--- charging ---");
+        }
+        let mut line = format!(
+            "{:6.1}% {}",
+            fill * 100.0,
+            "#".repeat((fill * 40.0).round() as usize)
+        );
+        if let Some((w, t0, released)) = watch.as_mut() {
+            let t = frame.received.duration_since(*t0).as_secs_f64();
+            if w.update(t, fill) && !*released {
+                *released = true;
+                line.push_str(&format!("   <-- RELEASE ({} ms)", (t * 1000.0).round()));
+            }
+            if fill < 0.02 {
+                println!("--- bar gone (peak {:.0}%) ---", w.peak() * 100.0);
+                watch = None;
+                continue;
+            }
+        } else {
+            continue;
+        }
+        println!("{line}");
+    }
     Ok(())
 }

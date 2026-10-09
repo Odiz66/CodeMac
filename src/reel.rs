@@ -38,6 +38,8 @@ pub struct ReelStats {
     pub hold_frames: u32,
     pub guard_frames: u32,
     pub duration_s: f64,
+    /// Average time between captured frames.
+    pub frame_ms: f32,
     outside_events: Vec<(f64, f32)>,
     drop_events: Vec<f64>,
     outside_streak: u32,
@@ -76,6 +78,7 @@ pub struct Step {
     pub bar_pred: Option<f32>,
     pub inside: Option<bool>,
     pub ended: Option<EndReason>,
+    pub lookahead_ms: f32,
 }
 
 pub struct Reel {
@@ -84,6 +87,10 @@ pub struct Reel {
     bar: Track,
     ctl: Controller,
     lookahead_s: f64,
+    lookahead_frames: f64,
+    /// Smoothed time between captured frames.
+    frame_dt: Option<f64>,
+    last_frame_t: Option<f64>,
     coast_s: f64,
     accel_weight: f64,
     max_jump_px: f32,
@@ -109,6 +116,9 @@ impl Reel {
             bar: Track::new(c.bar_history, 1),
             ctl: Controller::new(c),
             lookahead_s: c.lookahead_ms as f64 / 1000.0,
+            lookahead_frames: c.lookahead_frames as f64,
+            frame_dt: None,
+            last_frame_t: None,
             coast_s: c.coast_ms as f64 / 1000.0,
             accel_weight: c.fish_accel_weight as f64,
             max_jump_px: d.fish_max_jump * track_w,
@@ -166,13 +176,25 @@ impl Reel {
         }
 
         // Control.
-        let target = t + self.lookahead_s;
+        if !duplicate {
+            if let Some(prev) = self.last_frame_t {
+                let dt = t - prev;
+                if dt > 0.001 && dt < 0.1 {
+                    self.frame_dt = Some(self.frame_dt.map_or(dt, |f| 0.9 * f + 0.1 * dt));
+                }
+            }
+            self.last_frame_t = Some(t);
+        }
+        let frame_dt = self.frame_dt.unwrap_or(1.0 / 60.0);
+        let lookahead = self.lookahead_s + self.lookahead_frames * frame_dt;
+        step.lookahead_ms = (lookahead * 1000.0) as f32;
+        let target = t + lookahead;
         let predict = |track: &Track, accel: f64| {
             track.motion().map(|m| {
                 if t - m.t > self.coast_s {
                     (m.x, 0.0)
                 } else {
-                    m.at(target, accel, self.coast_s + self.lookahead_s)
+                    m.at(target, accel, self.coast_s + lookahead)
                 }
             })
         };
@@ -334,8 +356,10 @@ impl Reel {
     /// Finalises the statistics once the minigame has ended.
     pub fn finish(&mut self) -> ReelStats {
         let cutoff = self.last_visible - TAIL_IGNORE_S;
+        let frame_dt = self.frame_dt.unwrap_or(1.0 / 60.0);
         let s = &mut self.stats;
         s.duration_s = self.last_visible;
+        s.frame_ms = (frame_dt * 1000.0) as f32;
         let mut longest = 0;
         let mut streak = 0;
         let mut prev_t = f64::NEG_INFINITY;
@@ -345,7 +369,11 @@ impl Reel {
             counted += 1;
             worst = worst.max(px);
             // Consecutive events less than ~1.5 frames apart form one streak.
-            streak = if t - prev_t < 0.026 { streak + 1 } else { 1 };
+            streak = if t - prev_t < 1.5 * frame_dt {
+                streak + 1
+            } else {
+                1
+            };
             longest = longest.max(streak);
             prev_t = t;
         }

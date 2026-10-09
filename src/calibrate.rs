@@ -21,6 +21,7 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
 use crate::capture::{self, Capturer, Frame};
+use crate::cast::CastBar;
 use crate::config::{ColorsCfg, Config, Rgb};
 use crate::detect::{Detector, Layout, Palette, dist_sq, runs};
 use crate::hypr::Hypr;
@@ -31,6 +32,7 @@ use crate::signals::{self, Flags};
 pub enum Part {
     Region,
     Colors,
+    Cast,
 }
 
 #[derive(Debug, clap::Args)]
@@ -44,6 +46,9 @@ pub struct Args {
     /// Do not set up progress-bar reading.
     #[arg(long)]
     no_progress: bool,
+    /// Skip the power bar (perfect cast) step.
+    #[arg(long)]
+    no_cast: bool,
     /// Frames captured for the colour analysis.
     #[arg(long, default_value_t = 90)]
     frames: usize,
@@ -59,6 +64,9 @@ pub struct Args {
     /// With --png: X,Y of a pixel on the filled progress bar (repeatable).
     #[arg(long, value_name = "X,Y", value_parser = parse_point)]
     progress: Vec<(u32, u32)>,
+    /// With --png: X,Y of a pixel on the filled cast power bar (repeatable).
+    #[arg(long, value_name = "X,Y", value_parser = parse_point)]
+    cast_fill: Vec<(u32, u32)>,
     /// With --png: add to the existing colours instead of replacing them.
     #[arg(long)]
     append: bool,
@@ -81,6 +89,14 @@ struct Ctx {
 impl Ctx {
     /// Countdown, then read the cursor position.
     fn point(&self, what: &str) -> Result<(i32, i32)> {
+        self.countdown(what, "reading the cursor")?;
+        let (x, y) = self.hypr.cursor_pos()?;
+        println!("\r  -> cursor at {x}, {y}                          ");
+        Ok((x, y))
+    }
+
+    /// Prints `what`, then counts down (F6 ends it early).
+    fn countdown(&self, what: &str, action: &str) -> Result<()> {
         println!("\n> {what}");
         let start = self.flags.usr1_count();
         let mut tenths = self.countdown * 10;
@@ -95,15 +111,13 @@ impl Ctx {
                 break;
             }
             if tenths.is_multiple_of(10) {
-                print!("\r  reading the cursor in {} s (F6 = now) ", tenths / 10);
+                print!("\r  {action} in {} s (F6 = now) ", tenths / 10);
                 let _ = std::io::stdout().flush();
             }
             thread::sleep(Duration::from_millis(100));
             tenths -= 1;
         }
-        let (x, y) = self.hypr.cursor_pos()?;
-        println!("\r  -> cursor at {x}, {y}                          ");
-        Ok((x, y))
+        Ok(())
     }
 }
 
@@ -118,9 +132,11 @@ pub fn calibrate(path: &Path, mut cfg: Config, args: Args) -> Result<()> {
         "Calibration ({} capture). Ctrl+C cancels; F6 skips a countdown.",
         cap.name()
     );
-    println!("Have Fisch open with the Ruinous Oath equipped. Cast manually and get the reel");
-    println!("minigame on screen for each step (you can play it with the mouse button while");
-    println!("hovering - moving the mouse does not affect the minigame).");
+    if args.only != Some(Part::Cast) {
+        println!("Have Fisch open with the Ruinous Oath equipped. Cast manually and get the reel");
+        println!("minigame on screen for each step (you can play it with the mouse button while");
+        println!("hovering - moving the mouse does not affect the minigame).");
+    }
     match hypr.find_client(&cfg.window.class)? {
         Some(c) => {
             println!("Switching to {} in 2 s...", c.class);
@@ -140,15 +156,21 @@ pub fn calibrate(path: &Path, mut cfg: Config, args: Args) -> Result<()> {
         countdown: args.countdown,
     };
 
-    if args.only != Some(Part::Colors) {
+    let all = args.only.is_none();
+    if all || args.only == Some(Part::Region) {
         calibrate_region(&ctx, &mut cfg, &args)?;
         cfg.save(path)?;
         println!("\nSaved positions to {}.", path.display());
     }
-    if args.only != Some(Part::Region) {
+    if all || args.only == Some(Part::Colors) {
         calibrate_colors(&ctx, cap.as_mut(), &mut cfg, &args)?;
         cfg.save(path)?;
         println!("\nSaved colours to {}.", path.display());
+    }
+    if (all && !args.no_cast) || args.only == Some(Part::Cast) {
+        calibrate_cast(&ctx, cap.as_mut(), &mut cfg)?;
+        cfg.save(path)?;
+        println!("\nSaved the power bar to {}.", path.display());
     }
     println!(
         "\nNext: `cargo run --release -- debug` while a minigame is on screen to check detection,"
@@ -307,6 +329,90 @@ fn calibrate_colors(
         "  frames saved to {}/ (frame_000_ann.png shows what was detected)",
         dir.display()
     );
+    Ok(())
+}
+
+fn calibrate_cast(ctx: &Ctx, cap: &mut dyn Capturer, cfg: &mut Config) -> Result<()> {
+    println!("\n== Power bar (perfect cast) ==");
+    println!("For the next two steps hold the mouse button to charge a cast while you hover");
+    println!("(release and charge again whenever you need to).");
+    let empty = ctx.point("Hover the EMPTY end of the power bar - where the fill starts.")?;
+    let full =
+        ctx.point("Hover the FULL end of the power bar - where the fill ends when it is full.")?;
+    let len = (full.0 - empty.0).abs().max((full.1 - empty.1).abs());
+    if len < 10 {
+        bail!("the two ends are only {len} px apart; hover both ends of the power bar");
+    }
+    let probe = CastBar::from_points(empty, full, Palette::new(&[], 0.0));
+    ctx.countdown(
+        "Let go of the mouse button. When the countdown ends, press and HOLD it to charge a \
+         cast and keep holding for 3 seconds - I record the bar while it fills.",
+        "recording starts",
+    )?;
+    let start = Instant::now();
+    let mut frames = Vec::new();
+    while start.elapsed() < Duration::from_millis(3000) {
+        frames.push(cap.grab(probe.rect)?);
+    }
+    println!(
+        "\r  captured {} frames of the power bar                    ",
+        frames.len()
+    );
+
+    // By the second half of the recording the empty end has been filled for a
+    // while, so its dominant colours are the fill.
+    let px: Vec<[u8; 3]> = frames[frames.len() / 2..]
+        .iter()
+        .flat_map(|f| probe.empty_end_pixels(f))
+        .collect();
+    let fill: Vec<Rgb> = clusters(&px, 18.0, 4)
+        .into_iter()
+        .filter(|(_, s)| *s >= 0.2)
+        .take(3)
+        .map(|(c, _)| Rgb(c))
+        .collect();
+    if fill.is_empty() {
+        bail!("could not find a fill colour at the empty end of the bar");
+    }
+    let bar = CastBar::from_points(empty, full, Palette::new(&fill, cfg.cast.tolerance));
+    let fills: Vec<f32> = frames.iter().map(|f| bar.fill(f)).collect();
+    let peak = fills.iter().cloned().fold(0.0, f32::max);
+    let first_full = fills.iter().position(|&f| f >= 0.95);
+    println!("  fill colour(s): {}", list(&fill));
+    let step = (fills.len() / 15).max(1);
+    let timeline: Vec<String> = fills
+        .iter()
+        .step_by(step)
+        .map(|f| format!("{:.0}%", f * 100.0))
+        .collect();
+    println!("  fill over time: {}", timeline.join(" "));
+    match first_full {
+        Some(i) => println!("  full after {:.2} s", i as f64 * 3.0 / fills.len() as f64),
+        None => {
+            println!(
+                "  WARNING: the bar never looked more than {:.0}% full.",
+                peak * 100.0
+            );
+            println!("  If the top is drawn in another colour, add it by hand:");
+            println!("  calibrate --png calibration/cast_NNN.png --cast-fill X,Y --append");
+        }
+    }
+    if let Some(i) = first_full
+        && fills[i..].iter().any(|&f| f < 0.7)
+    {
+        println!("  The bar goes back down after filling; the macro releases on the way up.");
+    }
+
+    let dir = Path::new("calibration");
+    for (i, f) in frames.iter().enumerate().step_by(4) {
+        save_png(&dir.join(format!("cast_{i:03}.png")), f)?;
+    }
+    println!("  frames saved to {}/cast_*.png", dir.display());
+
+    let c = &mut cfg.cast;
+    (c.empty_x, c.empty_y) = empty;
+    (c.full_x, c.full_y) = full;
+    c.fill = fill;
     Ok(())
 }
 
@@ -567,8 +673,14 @@ fn median3x3(img: &Frame, x: u32, y: u32) -> Result<Rgb> {
 }
 
 fn pick_from_png(path: &Path, mut cfg: Config, args: &Args, png: &Path) -> Result<()> {
-    if args.bar.is_empty() && args.fish.is_empty() && args.progress.is_empty() {
-        bail!("--png needs at least one of --bar X,Y / --fish X,Y / --progress X,Y");
+    if args.bar.is_empty()
+        && args.fish.is_empty()
+        && args.progress.is_empty()
+        && args.cast_fill.is_empty()
+    {
+        bail!(
+            "--png needs at least one of --bar X,Y / --fish X,Y / --progress X,Y / --cast-fill X,Y"
+        );
     }
     let img = load_png(png).with_context(|| format!("loading {}", png.display()))?;
     let apply = |target: &mut Vec<Rgb>, points: &[(u32, u32)], name: &str| -> Result<()> {
@@ -596,6 +708,7 @@ fn pick_from_png(path: &Path, mut cfg: Config, args: &Args, png: &Path) -> Resul
     apply(&mut cfg.colors.bar, &args.bar, "bar")?;
     apply(&mut cfg.colors.fish, &args.fish, "fish")?;
     apply(&mut cfg.colors.progress, &args.progress, "progress")?;
+    apply(&mut cfg.cast.fill, &args.cast_fill, "cast fill")?;
     cfg.save(path)?;
     println!("Saved to {}.", path.display());
     Ok(())

@@ -113,6 +113,27 @@ impl NavOff {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CastMode {
+    /// "perfect" when the power bar is calibrated, otherwise "timed".
+    Auto,
+    /// Watch the power bar and release at the top.
+    Perfect,
+    /// Hold for `timing.cast_hold_ms`.
+    Timed,
+}
+
+impl CastMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            CastMode::Auto => "auto",
+            CastMode::Perfect => "perfect",
+            CastMode::Timed => "timed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowCfg {
@@ -215,6 +236,47 @@ impl Default for ColorsCfg {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct CastCfg {
+    pub mode: CastMode,
+    pub empty_x: i32,
+    pub empty_y: i32,
+    pub full_x: i32,
+    pub full_y: i32,
+    pub fill: Vec<Rgb>,
+    pub tolerance: f32,
+    pub release_at: f32,
+    pub lead_ms: f32,
+    pub max_hold_ms: u64,
+}
+
+impl Default for CastCfg {
+    fn default() -> Self {
+        Self {
+            mode: CastMode::Auto,
+            empty_x: 0,
+            empty_y: 0,
+            full_x: 0,
+            full_y: 0,
+            fill: Vec::new(),
+            tolerance: 45.0,
+            release_at: 0.96,
+            lead_ms: 20.0,
+            max_hold_ms: 3000,
+        }
+    }
+}
+
+impl CastCfg {
+    pub fn is_calibrated(&self) -> bool {
+        let len = (self.full_x - self.empty_x)
+            .abs()
+            .max((self.full_y - self.empty_y).abs());
+        len >= 10 && self.empty_y > 0 && !self.fill.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct DetectionCfg {
     pub row_samples: u32,
     pub row_band: f32,
@@ -259,6 +321,7 @@ pub struct ControllerCfg {
     pub kd: f32,
     pub neutral_duty: f32,
     pub lookahead_ms: f32,
+    pub lookahead_frames: f32,
     pub fish_history: usize,
     pub fish_accel_weight: f32,
     pub bar_history: usize,
@@ -270,10 +333,11 @@ impl Default for ControllerCfg {
     fn default() -> Self {
         Self {
             mode: ControlMode::Pd,
-            kp: 9.0,
-            kd: 2.1,
+            kp: 20.0,
+            kd: 3.0,
             neutral_duty: 0.5,
-            lookahead_ms: 50.0,
+            lookahead_ms: 0.0,
+            lookahead_frames: 1.75,
             fish_history: 5,
             fish_accel_weight: 0.5,
             bar_history: 3,
@@ -322,6 +386,7 @@ pub struct KeysCfg {
     pub shake: String,
     pub toggle_nav_each_cast: bool,
     pub nav_off: NavOff,
+    pub nav_refresh_ms: u64,
     pub reequip: String,
 }
 
@@ -332,7 +397,8 @@ impl Default for KeysCfg {
             shake: "KEY_ENTER".into(),
             toggle_nav_each_cast: true,
             nav_off: NavOff::ReelStart,
-            reequip: String::new(),
+            nav_refresh_ms: 0,
+            reequip: "KEY_1".into(),
         }
     }
 }
@@ -362,6 +428,7 @@ pub struct Config {
     pub colors: ColorsCfg,
     pub detection: DetectionCfg,
     pub controller: ControllerCfg,
+    pub cast: CastCfg,
     pub timing: TimingCfg,
     pub keys: KeysCfg,
     pub logging: LogCfg,
@@ -403,6 +470,9 @@ impl Config {
         if c.kp <= 0.0 {
             bail!("controller.kp must be > 0");
         }
+        if !(0.1..=1.0).contains(&self.cast.release_at) {
+            bail!("cast.release_at must be between 0.1 and 1.0");
+        }
         let d = &self.detection;
         if d.row_samples == 0 || !(0.0..=1.0).contains(&d.column_min_fraction) {
             bail!("detection.row_samples must be > 0 and detection.column_min_fraction in 0..1");
@@ -427,6 +497,7 @@ impl Config {
         let c = &self.colors;
         let d = &self.detection;
         let k = &self.controller;
+        let ca = &self.cast;
         let t = &self.timing;
         let keys = &self.keys;
         let lg = &self.logging;
@@ -434,9 +505,9 @@ impl Config {
         let _ = write!(
             s,
             r#"# fisch-macro configuration.
-# `cargo run --release -- calibrate` rewrites the [layout] and [colors] sections;
-# everything else is yours to tune. Coordinates are screen pixels as printed by
-# `hyprctl cursorpos`.
+# `cargo run --release -- calibrate` rewrites [layout], [colors] and the power-bar
+# part of [cast]; everything else is yours to tune. Coordinates are screen
+# pixels as printed by `hyprctl cursorpos`.
 
 [window]
 # Window class of Roblox (check with `hyprctl clients`).
@@ -519,9 +590,13 @@ kp = {kp}
 kd = {kd}
 # Hold duty that keeps the bar still (0.5 = holding and releasing are equally strong).
 neutral_duty = {neutral_duty}
-# How far past each frame to predict the fish and the bar. Covers capture
-# latency + one 60 Hz frame + input latency. Raise it if the bar lags behind.
+# How far past each frame to predict the fish and the bar:
+#   lookahead_ms + lookahead_frames * (measured time between captured frames)
+# It covers capture latency, the wait for the next frame and input latency, and
+# scales by itself with the monitor refresh rate (60 Hz vs 170 Hz).
+# Raise it if the bar lags behind the fish.
 lookahead_ms = {lookahead_ms}
+lookahead_frames = {lookahead_frames}
 # Frames used to estimate fish speed/acceleration (quadratic fit).
 fish_history = {fish_history}
 # 0 = ignore fish acceleration, 1 = trust it fully.
@@ -535,9 +610,28 @@ edge_guard = {edge_guard}
 # hidden by an effect.
 coast_ms = {coast_ms}
 
+[cast]
+# "perfect": watch the power bar while charging and release at the top.
+# "timed": hold for timing.cast_hold_ms. "auto": perfect once the bar is calibrated.
+mode = "{cast_mode}"
+# Screen points at the empty end and at the full end of the power bar
+# (`calibrate --only cast` sets them and the fill colours).
+empty_x = {empty_x}
+empty_y = {empty_y}
+full_x = {full_x}
+full_y = {full_y}
+fill = {cast_fill}
+tolerance = {cast_tolerance}
+# Release once the predicted fill reaches this fraction of the bar.
+release_at = {release_at}
+# Release this much earlier to cover capture + input latency.
+lead_ms = {lead_ms}
+# Release anyway after this long (bar not visible / never reached release_at).
+max_hold_ms = {max_hold_ms}
+
 [timing]
 focus_delay_ms = {focus_delay_ms}
-# How long LMB is held to charge the cast.
+# How long LMB is held to charge a "timed" cast.
 cast_hold_ms = {cast_hold_ms}
 # Wait after releasing the cast before UI navigation + Enter spam starts.
 after_cast_ms = {after_cast_ms}
@@ -562,8 +656,11 @@ shake = {shake}
 toggle_nav_each_cast = {toggle_nav_each_cast}
 # When to turn UI navigation back off: "reel_start" or "reel_end".
 nav_off = "{nav_off}"
-# Hotbar key of the rod (e.g. "KEY_1"). If set, the rod is unequipped and
-# re-equipped after a timeout to cancel a stuck cast. Empty = disabled.
+# If Enter stops pressing new shake buttons, set this to e.g. 1500: UI navigation
+# is then switched off and on again every 1.5 s to re-select the button. 0 = off.
+nav_refresh_ms = {nav_refresh_ms}
+# Hotbar key of the rod. After a timeout the rod is unequipped and re-equipped
+# to cancel a stuck cast. Empty = disabled.
 reequip = {reequip}
 
 [logging]
@@ -612,11 +709,22 @@ verbose_reel = {verbose_reel}
             kd = f(k.kd),
             neutral_duty = f(k.neutral_duty),
             lookahead_ms = f(k.lookahead_ms),
+            lookahead_frames = f(k.lookahead_frames),
             fish_history = k.fish_history,
             fish_accel_weight = f(k.fish_accel_weight),
             bar_history = k.bar_history,
             edge_guard = f(k.edge_guard),
             coast_ms = f(k.coast_ms),
+            cast_mode = ca.mode.as_str(),
+            empty_x = ca.empty_x,
+            empty_y = ca.empty_y,
+            full_x = ca.full_x,
+            full_y = ca.full_y,
+            cast_fill = colors_str(&ca.fill),
+            cast_tolerance = f(ca.tolerance),
+            release_at = f(ca.release_at),
+            lead_ms = f(ca.lead_ms),
+            max_hold_ms = ca.max_hold_ms,
             focus_delay_ms = t.focus_delay_ms,
             cast_hold_ms = t.cast_hold_ms,
             after_cast_ms = t.after_cast_ms,
@@ -631,6 +739,7 @@ verbose_reel = {verbose_reel}
             shake = toml_str(&keys.shake),
             toggle_nav_each_cast = keys.toggle_nav_each_cast,
             nav_off = keys.nav_off.as_str(),
+            nav_refresh_ms = keys.nav_refresh_ms,
             reequip = toml_str(&keys.reequip),
             catches_csv = toml_str(&lg.catches_csv),
             verbose_reel = lg.verbose_reel,
@@ -694,6 +803,10 @@ mod tests {
         cfg.controller.mode = ControlMode::BangBang;
         cfg.window.class = "weird\"class\\".into();
         cfg.keys.nav_off = NavOff::ReelEnd;
+        cfg.keys.nav_refresh_ms = 1500;
+        cfg.cast.mode = CastMode::Perfect;
+        cfg.cast.fill = vec![Rgb([0, 200, 80])];
+        cfg.cast.empty_x = 1400;
         let parsed: Config = toml::from_str(&cfg.to_toml()).unwrap();
         assert_eq!(parsed, cfg);
     }
