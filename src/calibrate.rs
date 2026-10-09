@@ -109,9 +109,9 @@ fn print_report(cfg: &Config, a: &Analysis) {
 
 /// Live detector output without sending input. Ends on Ctrl+C or the kill switch.
 pub fn watch(cfg: &Config) -> Result<(), String> {
-    println!("Capture: {}", capture::probe(cfg.capture_backend, &cfg.region)?);
-    let capture =
-        CaptureThread::start(cfg.region, Detector::from_config(cfg), cfg.capture_interval, cfg.capture_backend);
+    let mut capturer = Capturer::new(cfg.capture_backend);
+    println!("Capture: {}", capture::probe(&mut capturer, &cfg.region)?);
+    let capture = CaptureThread::start(capturer, cfg.region, Detector::from_config(cfg), cfg.capture_interval);
     let mut tracker = Tracker::new(cfg.track.deadband, cfg.track.lookahead);
     let mut frames = 0u32;
     let mut latency = Duration::ZERO;

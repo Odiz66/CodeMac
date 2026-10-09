@@ -35,9 +35,7 @@ pub enum Axis {
 /// How the screen region is captured (`detect.capture_backend`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureBackend {
-    /// Native screencopy, falling back to grim if it does not work.
-    Auto,
-    /// Native wlr-screencopy client with a persistent connection.
+    /// Built-in wlr-screencopy client with a persistent connection.
     Screencopy,
     /// One `grim` process per frame.
     Grim,
@@ -194,14 +192,11 @@ impl Config {
         };
 
         let capture_interval = r.millis("detect.capture_interval_ms", 0)?;
-        let capture_backend = match r.string("detect.capture_backend", "auto")?.as_str() {
-            "auto" => CaptureBackend::Auto,
+        let capture_backend = match r.string("detect.capture_backend", "screencopy")?.as_str() {
             "screencopy" => CaptureBackend::Screencopy,
             "grim" => CaptureBackend::Grim,
             other => {
-                return Err(format!(
-                    "detect.capture_backend: unknown backend `{other}` (use auto, screencopy or grim)"
-                ));
+                return Err(format!("detect.capture_backend: unknown backend `{other}` (use screencopy or grim)"));
             }
         };
         let active = r.color_target("detect.active", 20)?;

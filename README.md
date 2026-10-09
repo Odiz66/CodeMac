@@ -30,9 +30,13 @@ Three reeling styles are supported (`mode` in the config):
   - The game's frame rate (240 fps) doesn't raise that: only frames Hyprland
     actually composites and shows can be captured, so 165 Hz is the ceiling.
     It also doesn't hurt anything.
-  - `capture_backend = "grim"` runs `grim -t ppm -g "x,y wxh" -` per frame
-    instead (about 50/s). `"auto"`, the default, uses the built-in client and
-    falls back to grim if that fails.
+  - The connection is opened once and reused for every catch. In Hyprland
+    0.56 each capture client and region gets a capture session that is only
+    freed when the monitor goes away, so reconnecting per catch would pile
+    sessions up. With one connection there is exactly one.
+  - `capture_backend = "grim"` runs grim per frame instead (about 50/s). It's
+    only for troubleshooting: grim copies the whole monitor for every frame,
+    and on Hyprland 0.56 each grim run leaves such a session behind.
 - **Catch done**: the catch counts as done when the minigame's color has been
   gone from the region for `end_grace_ms`. It also counts as done right away if
   an optional "done" color shows up (a "Caught!" banner, for example).
@@ -58,7 +62,7 @@ PNG writer for calibration screenshots are built in.
 All commands are for the **fish** shell.
 
 ```fish
-sudo pacman -S --needed rust slurp grim    # grim: only for the fallback backend
+sudo pacman -S --needed rust slurp
 cd ~/path/to/CodeMac
 cargo build --release
 ```
@@ -157,7 +161,9 @@ Edit `~/.config/fishmacro/config.toml`. Every setting is explained in it; see
    - prints the most common colors in the region and what the detector finds
      with your current settings.
 
-   Copy colors from that list into the config:
+   Copy colors from that list into the config. Use these numbers rather than
+   a color picker: Hyprland hands screen captures over converted to sRGB, so
+   they can differ slightly from what a picker shows.
    - `detect.active_color`: something in the region **only while the minigame
      is up** (bar frame or background). Required for `hold`/`spam`. In `track`
      mode you can leave it `""`, and then the marker/zone colors are used.
@@ -231,9 +237,25 @@ click it once on your real mouse.
 - **The macro never stops**: `active_color` also matches when the minigame is
   closed. Lower `active_tolerance` or pick a more specific color.
 - **`watch` shows far fewer fps than your refresh rate**: check the `Capture:`
-  line. If it says grim, the built-in client failed (the reason is printed just
-  above it). With the built-in client the fps should be close to your refresh
-  rate (Hyprland redraws for every capture request, even on a still screen).
+  line. With the built-in client the fps should be close to your refresh rate
+  (Hyprland redraws for every capture request, even on a still screen). If it
+  says "whole-monitor copy", your monitor scale isn't 1, so the macro copies the
+  whole monitor at ~30/s. Hyprland 0.56 would otherwise create a new capture
+  session for every frame. Set the monitor scale to 1 for full speed.
+- **Captures time out or show "Permission denied to share screen"**: you have
+  `ecosystem:enforce_permissions` enabled. Allow the binary, using its full
+  path (a regex, so `.` matches any character), then restart Hyprland:
+  ```lua
+  hl.permission({ binary = "/home/you/.cargo/bin/fishmacro", type = "screencopy", mode = "allow" })
+  ```
+  Legacy config: `permission = /home/you/.cargo/bin/fishmacro, screencopy, allow`.
+  A pending permission prompt holds every capture until you answer it.
+- **The mouse cursor shows up in the region**: on NVIDIA with VRR or tearing,
+  Hyprland uses a software cursor that is part of every capture. Keep the
+  cursor away from the bar (most games hide it anyway).
+- **A "screen recording" indicator appears in your bar while reeling**:
+  expected. Hyprland posts `screencast` events while something captures the
+  screen, and turns them off 500 ms after the last capture.
 - **Cursor move fails**: `hyprctl` must run inside the Hyprland session
   (`HYPRLAND_INSTANCE_SIGNATURE` set), and `[hyprland] config_format` must match
   your config.

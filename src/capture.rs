@@ -1,11 +1,12 @@
 //! Screen capture of a small region.
 //!
-//! Two backends, both using the compositor's wlr-screencopy protocol:
-//! - `screencopy`: our own client (src/screencopy.rs) that keeps one Wayland
-//!   connection open, fast enough to follow every refresh of a 165 Hz monitor;
-//! - `grim`: spawns `grim -t ppm` per frame (~20 ms each); simple fallback.
+//! - `screencopy` (default): our own wlr-screencopy client (src/screencopy.rs)
+//!   with one persistent Wayland connection; one capture per monitor refresh,
+//!   e.g. 165/s on a 165 Hz monitor.
+//! - `grim`: spawns `grim -t ppm` per frame (~20 ms each).
 //!
-//! `auto` uses screencopy and falls back to grim if it does not work.
+//! Keep one `Capturer` for the whole run (it moves into each capture thread
+//! and comes back) so the compositor sees one long-lived capture client.
 
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -35,64 +36,50 @@ impl Frame {
     }
 }
 
-/// Captures regions with the configured backend. Not `Send`: create it on
-/// the thread that uses it.
+/// Captures regions with the configured backend.
 pub struct Capturer {
     backend: CaptureBackend,
     native: Option<Screencopy>,
-    /// `auto` switched to grim because screencopy never worked.
-    use_grim: bool,
-    native_worked: bool,
 }
 
 impl Capturer {
     pub fn new(backend: CaptureBackend) -> Capturer {
-        Capturer { backend, native: None, use_grim: backend == CaptureBackend::Grim, native_worked: false }
+        Capturer { backend, native: None }
     }
 
     pub fn grab(&mut self, region: &Region) -> Result<Frame, String> {
-        if self.use_grim {
+        if self.backend == CaptureBackend::Grim {
             return grim_grab(region);
         }
         if self.native.is_none() {
-            match Screencopy::connect() {
-                Ok(sc) => self.native = Some(sc),
-                Err(e) => return self.native_failed(e, region),
-            }
+            self.native = Some(Screencopy::connect()?);
         }
-        match self.native.as_mut().expect("connected above").grab(region) {
-            Ok(frame) => {
-                self.native_worked = true;
-                Ok(frame)
-            }
-            Err(e) => self.native_failed(e, region),
+        let result = self.native.as_mut().expect("connected above").grab(region);
+        if result.is_err() {
+            // The connection may be unusable now; reconnect on the next grab.
+            self.native = None;
         }
+        result
     }
 
-    fn native_failed(&mut self, error: String, region: &Region) -> Result<Frame, String> {
-        // The connection may be unusable now; reconnect on the next grab.
-        self.native = None;
-        if self.backend == CaptureBackend::Auto && !self.native_worked {
-            eprintln!("note: {error}; falling back to grim");
-            self.use_grim = true;
-            return grim_grab(region);
-        }
-        Err(error)
+    /// Minimum time between captures the backend needs.
+    pub fn min_interval(&self) -> Duration {
+        self.native.as_ref().map_or(Duration::ZERO, Screencopy::min_interval)
     }
 
     /// Which backend is in use, for status lines.
     pub fn describe(&self) -> String {
-        match (&self.native, self.use_grim) {
-            (_, true) => "grim (one process per frame)".into(),
-            (Some(sc), false) => format!("native {}", sc.describe()),
-            (None, false) => "native wlr-screencopy".into(),
+        match (&self.native, self.backend) {
+            (_, CaptureBackend::Grim) => "grim (one process per frame)".into(),
+            (Some(sc), _) => format!("built-in {}", sc.describe()),
+            (None, _) => "built-in wlr-screencopy".into(),
         }
     }
 }
 
-/// Grabs `region` once and reports which backend worked and how long it took.
-pub fn probe(backend: CaptureBackend, region: &Region) -> Result<String, String> {
-    let mut capturer = Capturer::new(backend);
+/// Captures `region` twice (setup, then steady state) and reports the
+/// backend and the time per capture.
+pub fn probe(capturer: &mut Capturer, region: &Region) -> Result<String, String> {
     capturer.grab(region)?;
     let started = Instant::now();
     capturer.grab(region)?;
@@ -169,29 +156,29 @@ pub fn parse_ppm(data: &[u8]) -> Result<Frame, String> {
 pub struct Sample {
     /// When the capture finished.
     pub at: Instant,
-    /// How long grim took.
+    /// How long the capture took.
     pub latency: Duration,
     pub analysis: Analysis,
 }
 
 /// Captures and analyses frames on a background thread so the control loop
-/// never blocks on grim.
+/// never blocks on a capture.
 pub struct CaptureThread {
     stop: Arc<AtomicBool>,
     pub rx: Receiver<Result<Sample, String>>,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Capturer>>,
 }
 
-/// Consecutive grim failures tolerated before giving up.
+/// Consecutive capture failures tolerated before giving up.
 const MAX_FAILURES: u32 = 3;
 
 impl CaptureThread {
-    pub fn start(region: Region, detector: Detector, min_interval: Duration, backend: CaptureBackend) -> CaptureThread {
+    /// Starts capturing with `capturer`; get it back with [`CaptureThread::finish`].
+    pub fn start(mut capturer: Capturer, region: Region, detector: Detector, min_interval: Duration) -> CaptureThread {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let stop_flag = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            let mut capturer = Capturer::new(backend);
             let mut failures = 0;
             while !stop_flag.load(Ordering::SeqCst) {
                 let started = Instant::now();
@@ -212,13 +199,22 @@ impl CaptureThread {
                         break;
                     }
                 }
+                let interval = min_interval.max(capturer.min_interval());
                 let elapsed = started.elapsed();
-                if elapsed < min_interval {
-                    thread::sleep(min_interval - elapsed);
+                if elapsed < interval {
+                    thread::sleep(interval - elapsed);
                 }
             }
+            capturer
         });
         CaptureThread { stop, rx, handle: Some(handle) }
+    }
+
+    /// Stops the thread and returns the capturer for reuse (`None` if the
+    /// thread panicked).
+    pub fn finish(mut self) -> Option<Capturer> {
+        self.stop.store(true, Ordering::SeqCst);
+        self.handle.take().and_then(|h| h.join().ok())
     }
 }
 

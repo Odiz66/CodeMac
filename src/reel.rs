@@ -4,7 +4,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::capture::{CaptureThread, Sample};
+use crate::capture::{CaptureThread, Capturer, Sample};
 use crate::config::{Config, Mode, SpamConfig};
 use crate::hypr;
 use crate::input::VirtualInput;
@@ -49,18 +49,19 @@ impl Outcome {
 }
 
 /// Runs one session. Every button is released before this returns, whatever
-/// the outcome.
-pub fn reel(cfg: &Config, input: &mut VirtualInput) -> Result<Outcome, String> {
+/// the outcome. `capturer` is reused across sessions (one long-lived capture
+/// connection); it is replaced if the capture thread died.
+pub fn reel(cfg: &Config, input: &mut VirtualInput, capturer: &mut Option<Capturer>) -> Result<Outcome, String> {
     if let Some((x, y)) = cfg.cursor {
         hypr::move_cursor(x, y, cfg.hyprland_config)?;
         // Let the game see the pointer at its new position before clicking.
         thread::sleep(Duration::from_millis(30));
     }
-    let capture =
-        CaptureThread::start(cfg.region, Detector::from_config(cfg), cfg.capture_interval, cfg.capture_backend);
+    let cap = capturer.take().unwrap_or_else(|| Capturer::new(cfg.capture_backend));
+    let capture = CaptureThread::start(cap, cfg.region, Detector::from_config(cfg), cfg.capture_interval);
     let result = run(cfg, input, &capture);
     let released = input.release_all();
-    drop(capture);
+    *capturer = capture.finish();
     let outcome = result?;
     released.map_err(|e| format!("failed to release buttons: {e}"))?;
     Ok(outcome)

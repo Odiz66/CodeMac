@@ -5,6 +5,10 @@
 //! roundtrips every time (~20 ms). Keeping the connection and a shared-memory
 //! buffer around, each capture is just: `capture_output_region` -> `copy` ->
 //! `ready`, which can keep up with the monitor refresh (e.g. 165 Hz).
+//!
+//! Keep one `Screencopy` alive for as long as possible: Hyprland 0.56 creates
+//! a capture session per client and region and only frees it when the monitor
+//! goes away, so a new connection per capture would pile sessions up.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -16,6 +20,8 @@ use crate::wayland::{Connection, DISPLAY_ID, Event, Message};
 
 /// How long one capture may take before giving up.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+/// Rate limit when the whole monitor has to be copied (scaled monitors).
+const FULL_OUTPUT_INTERVAL: Duration = Duration::from_millis(33);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 // Opcodes (requests and events are numbered separately, in XML order).
@@ -37,6 +43,8 @@ const WL_OUTPUT_EV_NAME: u16 = 4;
 const XDG_OUTPUT_MANAGER_GET_XDG_OUTPUT: u16 = 1;
 const XDG_OUTPUT_EV_LOGICAL_POSITION: u16 = 0;
 const XDG_OUTPUT_EV_LOGICAL_SIZE: u16 = 1;
+const WL_SHM_EV_FORMAT: u16 = 0;
+const SCREENCOPY_MANAGER_CAPTURE_OUTPUT: u16 = 0;
 const SCREENCOPY_MANAGER_CAPTURE_OUTPUT_REGION: u16 = 1;
 const FRAME_COPY: u16 = 0;
 const FRAME_DESTROY: u16 = 1;
@@ -89,6 +97,33 @@ impl Output {
         });
         (x, y, w, h)
     }
+
+    /// Physical pixels per logical pixel (1.0 when unscaled).
+    fn pixel_scale(&self) -> f64 {
+        match self.logical_size {
+            Some((lw, _)) if lw > 0 && self.mode.0 > 0 => self.mode.0 as f64 / lw as f64,
+            _ => self.scale.max(1) as f64,
+        }
+    }
+}
+
+/// A rectangle in buffer pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+/// What to ask the compositor for, and which part of the result to keep.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Plan {
+    output: u32,
+    /// Output-local logical region, or `None` for the whole output.
+    region: Option<(i32, i32, i32, i32)>,
+    /// Part of the returned buffer to keep (whole-output captures only).
+    crop: Option<Rect>,
 }
 
 /// Buffer parameters the compositor asks for.
@@ -116,6 +151,10 @@ impl ShmBuffer {
     }
 }
 
+// SAFETY: the mapping is owned exclusively by this struct (no aliases), so
+// moving it to another thread is fine; it is never shared between threads.
+unsafe impl Send for ShmBuffer {}
+
 impl Drop for ShmBuffer {
     fn drop(&mut self) {
         // SAFETY: unmapping the region mapped in `create_buffer`.
@@ -126,11 +165,16 @@ impl Drop for ShmBuffer {
 pub struct Screencopy {
     conn: Connection,
     shm: u32,
+    /// Formats wl_shm accepts; creating a buffer in any other is a fatal error.
+    shm_formats: Vec<u32>,
     manager: u32,
     manager_version: u32,
     outputs: Vec<Output>,
     xdg_outputs: Vec<(u32, usize)>,
     buffer: Option<ShmBuffer>,
+    /// The last capture had to copy the whole monitor (scaled monitor).
+    full_output: bool,
+    warned_full_output: bool,
 }
 
 impl Screencopy {
@@ -188,8 +232,19 @@ impl Screencopy {
             }
         }
 
-        let mut sc = Screencopy { conn, shm, manager, manager_version, outputs, xdg_outputs, buffer: None };
-        // Receive the output descriptions.
+        let mut sc = Screencopy {
+            conn,
+            shm,
+            shm_formats: Vec::new(),
+            manager,
+            manager_version,
+            outputs,
+            xdg_outputs,
+            buffer: None,
+            full_output: false,
+            warned_full_output: false,
+        };
+        // Receive the output descriptions and the wl_shm formats.
         sc.roundtrip()?;
         if sc.outputs.is_empty() {
             return Err(io::Error::other("compositor reports no outputs"));
@@ -199,7 +254,13 @@ impl Screencopy {
 
     /// Short description for status lines.
     pub fn describe(&self) -> String {
-        format!("wlr-screencopy v{}", self.manager_version)
+        let mode = if self.full_output { ", whole-monitor copy (scaled monitor)" } else { "" };
+        format!("wlr-screencopy v{}{mode}", self.manager_version)
+    }
+
+    /// Minimum time between captures this client should keep.
+    pub fn min_interval(&self) -> Duration {
+        if self.full_output { FULL_OUTPUT_INTERVAL } else { Duration::ZERO }
     }
 
     /// Captures `region` (layout coordinates) from the monitor that contains it.
@@ -208,20 +269,32 @@ impl Screencopy {
     }
 
     fn grab_inner(&mut self, region: &Region) -> io::Result<Frame> {
-        let (output, x, y) = self.locate(region)?;
+        let plan = self.plan(region)?;
+        self.full_output = plan.region.is_none();
+        if self.full_output && !self.warned_full_output {
+            self.warned_full_output = true;
+            eprintln!(
+                "note: the monitor scale is not 1, so the whole monitor is copied and cropped (max ~30 captures/s). \
+                 Hyprland 0.56 keeps a new capture session for every region capture on scaled monitors. \
+                 Use monitor scale 1 for full-rate capture."
+            );
+        }
         let frame = self.conn.new_id()?;
-        self.conn.send(
-            &Message::new(self.manager, SCREENCOPY_MANAGER_CAPTURE_OUTPUT_REGION)
+        let request = match plan.region {
+            Some((x, y, w, h)) => Message::new(self.manager, SCREENCOPY_MANAGER_CAPTURE_OUTPUT_REGION)
                 .object(frame)
                 .int(0) // no cursor
-                .object(output)
+                .object(plan.output)
                 .int(x)
                 .int(y)
-                .int(region.width as i32)
-                .int(region.height as i32),
-            None,
-        )?;
-        let result = self.copy_frame(frame);
+                .int(w)
+                .int(h),
+            None => {
+                Message::new(self.manager, SCREENCOPY_MANAGER_CAPTURE_OUTPUT).object(frame).int(0).object(plan.output)
+            }
+        };
+        self.conn.send(&request, None)?;
+        let result = self.copy_frame(frame, plan.crop);
         // Always destroy the frame object, even after `failed`.
         let destroyed = self.conn.send(&Message::new(frame, FRAME_DESTROY), None);
         let frame = result?;
@@ -229,7 +302,7 @@ impl Screencopy {
         Ok(frame)
     }
 
-    fn copy_frame(&mut self, frame: u32) -> io::Result<Frame> {
+    fn copy_frame(&mut self, frame: u32, crop: Option<Rect>) -> io::Result<Frame> {
         let deadline = Instant::now() + FRAME_TIMEOUT;
 
         // 1. Buffer requirements. With v3 the list ends with buffer_done;
@@ -254,8 +327,8 @@ impl Screencopy {
                 _ => {}
             }
         }
-        let spec = spec.ok_or_else(|| io::Error::other("compositor offered no shared-memory buffer"))?;
-        check_format(spec.format)?;
+        let mut spec = spec.ok_or_else(|| io::Error::other("compositor offered no shared-memory buffer"))?;
+        spec.format = self.pick_format(spec.format)?;
 
         // 2. Copy into our (reused) buffer.
         let buffer = self.ensure_buffer(spec)?;
@@ -278,20 +351,55 @@ impl Screencopy {
             }
         }
 
+        let full = Rect { x: 0, y: 0, width: spec.width, height: spec.height };
+        let crop = match crop {
+            Some(c) => c.clamp_to(full).ok_or_else(|| io::Error::other("region lies outside the captured monitor"))?,
+            None => full,
+        };
         let buffer = self.buffer.as_ref().expect("buffer was just ensured");
-        let rgb = to_rgb(buffer.pixels(), spec, y_invert)?;
-        Ok(Frame { width: spec.width as usize, height: spec.height as usize, rgb })
+        let rgb = to_rgb(buffer.pixels(), spec, crop, y_invert)?;
+        Ok(Frame { width: crop.width as usize, height: crop.height as usize, rgb })
     }
 
-    /// The output containing `region` and the region's output-local position.
-    fn locate(&self, region: &Region) -> io::Result<(u32, i32, i32)> {
+    /// The offered format if wl_shm lists it, else its opaque twin (Hyprland
+    /// accepts both); creating a buffer in an unlisted format is fatal.
+    fn pick_format(&self, offered: u32) -> io::Result<u32> {
+        check_format(offered)?;
+        if self.shm_formats.is_empty() || self.shm_formats.contains(&offered) {
+            return Ok(offered);
+        }
+        match opaque_variant(offered) {
+            Some(alt) if self.shm_formats.contains(&alt) => Ok(alt),
+            _ => Err(io::Error::other(format!(
+                "compositor offered pixel format 0x{offered:08x} that wl_shm doesn't list"
+            ))),
+        }
+    }
+
+    /// Finds the output containing `region` and decides how to capture it.
+    fn plan(&self, region: &Region) -> io::Result<Plan> {
         let (rx, ry) = (region.x, region.y);
         let (rw, rh) = (region.width as i32, region.height as i32);
         for output in &self.outputs {
             let (ox, oy, ow, oh) = output.logical_rect();
-            if rx >= ox && ry >= oy && rx + rw <= ox + ow && ry + rh <= oy + oh {
-                return Ok((output.id, rx - ox, ry - oy));
+            if !(rx >= ox && ry >= oy && rx + rw <= ox + ow && ry + rh <= oy + oh) {
+                continue;
             }
+            let (lx, ly) = (rx - ox, ry - oy);
+            if output.transform != 0 {
+                return Err(io::Error::other(
+                    "rotated/flipped monitors are not supported by the built-in capture; set capture_backend = \"grim\"",
+                ));
+            }
+            let scale = output.pixel_scale();
+            if (scale - 1.0).abs() < 1e-6 {
+                return Ok(Plan { output: output.id, region: Some((lx, ly, rw, rh)), crop: None });
+            }
+            // Scaled monitor: copy it whole (Hyprland reuses that session) and
+            // crop the region in physical pixels.
+            let px = |v: i32| (v as f64 * scale).round().max(0.0) as u32;
+            let crop = Rect { x: px(lx), y: px(ly), width: px(rw).max(1), height: px(rh).max(1) };
+            return Ok(Plan { output: output.id, region: None, crop: Some(crop) });
         }
         let monitors: Vec<String> = self
             .outputs
@@ -379,6 +487,12 @@ impl Screencopy {
     }
 
     fn handle_output_event(&mut self, ev: &Event) -> io::Result<bool> {
+        if ev.object == self.shm {
+            if ev.opcode == WL_SHM_EV_FORMAT {
+                self.shm_formats.push(ev.reader().uint()?);
+            }
+            return Ok(true);
+        }
         if let Some(output) = self.outputs.iter_mut().find(|o| o.id == ev.object) {
             let mut r = ev.reader();
             match ev.opcode {
@@ -477,27 +591,53 @@ fn bytes_per_pixel(format: u32) -> u32 {
     }
 }
 
+/// The same layout without alpha.
+fn opaque_variant(format: u32) -> Option<u32> {
+    match format {
+        SHM_ARGB8888 => Some(SHM_XRGB8888),
+        SHM_ABGR8888 => Some(SHM_XBGR8888),
+        SHM_ARGB2101010 => Some(SHM_XRGB2101010),
+        SHM_ABGR2101010 => Some(SHM_XBGR2101010),
+        _ => None,
+    }
+}
+
+impl Rect {
+    /// The part of `self` inside `bounds`, if any.
+    fn clamp_to(self, bounds: Rect) -> Option<Rect> {
+        let x0 = self.x.max(bounds.x);
+        let y0 = self.y.max(bounds.y);
+        let x1 = (self.x + self.width).min(bounds.x + bounds.width);
+        let y1 = (self.y + self.height).min(bounds.y + bounds.height);
+        (x1 > x0 && y1 > y0).then_some(Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 })
+    }
+}
+
 fn check_format(format: u32) -> io::Result<()> {
     match format {
         SHM_ARGB8888 | SHM_XRGB8888 | SHM_ABGR8888 | SHM_XBGR8888 | SHM_ARGB2101010 | SHM_XRGB2101010
         | SHM_ABGR2101010 | SHM_XBGR2101010 | SHM_RGB888 | SHM_BGR888 => Ok(()),
-        other => Err(io::Error::other(format!(
-            "unsupported pixel format 0x{other:08x}; set capture_backend = \"grim\" in the config"
-        ))),
+        other => Err(io::Error::other(format!("unsupported pixel format 0x{other:08x}"))),
     }
 }
 
-/// Converts the compositor's buffer to tightly packed RGB, top row first.
-fn to_rgb(data: &[u8], spec: BufferSpec, y_invert: bool) -> io::Result<Vec<u8>> {
+/// Converts `crop` of the compositor's buffer to tightly packed RGB, top row first.
+fn to_rgb(data: &[u8], spec: BufferSpec, crop: Rect, y_invert: bool) -> io::Result<Vec<u8>> {
     let (w, h, stride) = (spec.width as usize, spec.height as usize, spec.stride as usize);
     let bpp = bytes_per_pixel(spec.format) as usize;
     if data.len() < stride * h || stride < w * bpp {
         return Err(io::Error::other("capture buffer smaller than announced"));
     }
-    let mut out = Vec::with_capacity(w * h * 3);
-    for row in 0..h {
+    let (cx, cy, cw, ch) = (crop.x as usize, crop.y as usize, crop.width as usize, crop.height as usize);
+    if cx + cw > w || cy + ch > h {
+        return Err(io::Error::other("crop outside the capture buffer"));
+    }
+    let mut out = Vec::with_capacity(cw * ch * 3);
+    for row in cy..cy + ch {
+        // With y_invert the buffer's first row is the bottom of the image.
         let src_row = if y_invert { h - 1 - row } else { row };
-        let line = &data[src_row * stride..src_row * stride + w * bpp];
+        let start = src_row * stride + cx * bpp;
+        let line = &data[start..start + cw * bpp];
         for px in line.chunks_exact(bpp) {
             let rgb = match spec.format {
                 // Little-endian 0xAARRGGBB: bytes B, G, R, A.
@@ -537,33 +677,74 @@ mod tests {
         assert_eq!(SHM_XBGR2101010, 0x3033_4258);
     }
 
+    fn all(s: BufferSpec) -> Rect {
+        Rect { x: 0, y: 0, width: s.width, height: s.height }
+    }
+
     #[test]
     fn converts_8bit_formats_with_stride_padding() {
         // 1x2 image, stride 8 (4 bytes of padding per row).
         let data = [10, 20, 30, 255, 0, 0, 0, 0, 40, 50, 60, 255, 0, 0, 0, 0];
-        let rgb = to_rgb(&data, spec(SHM_XRGB8888, 1, 2, 8), false).unwrap();
-        assert_eq!(rgb, [30, 20, 10, 60, 50, 40]);
-        let rgb = to_rgb(&data, spec(SHM_XBGR8888, 1, 2, 8), false).unwrap();
-        assert_eq!(rgb, [10, 20, 30, 40, 50, 60]);
-        let flipped = to_rgb(&data, spec(SHM_XBGR8888, 1, 2, 8), true).unwrap();
-        assert_eq!(flipped, [40, 50, 60, 10, 20, 30]);
+        let s = spec(SHM_XRGB8888, 1, 2, 8);
+        assert_eq!(to_rgb(&data, s, all(s), false).unwrap(), [30, 20, 10, 60, 50, 40]);
+        let s = spec(SHM_XBGR8888, 1, 2, 8);
+        assert_eq!(to_rgb(&data, s, all(s), false).unwrap(), [10, 20, 30, 40, 50, 60]);
+        assert_eq!(to_rgb(&data, s, all(s), true).unwrap(), [40, 50, 60, 10, 20, 30]);
     }
 
     #[test]
     fn converts_10bit_formats() {
         // R = 1023, G = 512, B = 0 in XRGB2101010.
         let v: u32 = (1023 << 20) | (512 << 10);
-        let rgb = to_rgb(&v.to_le_bytes(), spec(SHM_XRGB2101010, 1, 1, 4), false).unwrap();
-        assert_eq!(rgb, [255, 128, 0]);
+        let s = spec(SHM_XRGB2101010, 1, 1, 4);
+        assert_eq!(to_rgb(&v.to_le_bytes(), s, all(s), false).unwrap(), [255, 128, 0]);
         // Same bits in XBGR2101010 mean B = 1023, R = 0.
-        let rgb = to_rgb(&v.to_le_bytes(), spec(SHM_XBGR2101010, 1, 1, 4), false).unwrap();
-        assert_eq!(rgb, [0, 128, 255]);
+        let s = spec(SHM_XBGR2101010, 1, 1, 4);
+        assert_eq!(to_rgb(&v.to_le_bytes(), s, all(s), false).unwrap(), [0, 128, 255]);
+    }
+
+    #[test]
+    fn crops_with_and_without_y_invert() {
+        // 3x3 XBGR image where pixel (x, y) = [x, y, 0].
+        let mut data = Vec::new();
+        for y in 0..3u8 {
+            for x in 0..3u8 {
+                data.extend_from_slice(&[x, y, 0, 255]);
+            }
+        }
+        let s = spec(SHM_XBGR8888, 3, 3, 12);
+        let crop = Rect { x: 1, y: 0, width: 2, height: 2 };
+        assert_eq!(to_rgb(&data, s, crop, false).unwrap(), [1, 0, 0, 2, 0, 0, 1, 1, 0, 2, 1, 0]);
+        // y_invert: buffer row 2 is the image's top row.
+        assert_eq!(to_rgb(&data, s, crop, true).unwrap(), [1, 2, 0, 2, 2, 0, 1, 1, 0, 2, 1, 0]);
+        assert!(to_rgb(&data, s, Rect { x: 2, y: 0, width: 2, height: 1 }, false).is_err());
+    }
+
+    #[test]
+    fn rect_clamping() {
+        let bounds = Rect { x: 0, y: 0, width: 100, height: 50 };
+        assert_eq!(
+            Rect { x: 90, y: 40, width: 20, height: 20 }.clamp_to(bounds),
+            Some(Rect { x: 90, y: 40, width: 10, height: 10 })
+        );
+        assert_eq!(Rect { x: 100, y: 0, width: 5, height: 5 }.clamp_to(bounds), None);
     }
 
     #[test]
     fn rejects_unknown_format_and_short_buffers() {
         assert!(check_format(fourcc(b"NV12")).is_err());
-        assert!(to_rgb(&[0; 4], spec(SHM_XRGB8888, 2, 1, 8), false).is_err());
+        let s = spec(SHM_XRGB8888, 2, 1, 8);
+        assert!(to_rgb(&[0; 4], s, all(s), false).is_err());
+        assert_eq!(opaque_variant(SHM_ARGB8888), Some(SHM_XRGB8888));
+        assert_eq!(opaque_variant(SHM_ABGR8888), Some(SHM_XBGR8888));
+    }
+
+    #[test]
+    fn pixel_scale_from_xdg_output() {
+        let o = Output { mode: (2560, 1440), logical_size: Some((2560, 1440)), ..Output::default() };
+        assert_eq!(o.pixel_scale(), 1.0);
+        let o = Output { mode: (2560, 1440), logical_size: Some((2048, 1152)), ..o };
+        assert_eq!(o.pixel_scale(), 1.25);
     }
 
     #[test]

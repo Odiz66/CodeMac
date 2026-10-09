@@ -23,6 +23,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use capture::Capturer;
 use config::{CaptureBackend, Config, Mode};
 use input::VirtualInput;
 
@@ -142,7 +143,10 @@ fn run(cfg: &Config, dry_run: bool) -> Result<(), String> {
         Mode::Track => "track".to_string(),
     };
     println!("fishmacro: mode {mode}, button {:?}, region {}", cfg.button, cfg.region.geometry());
-    println!("Capture: {}", capture::probe(cfg.capture_backend, &cfg.region)?);
+    // One capturer (one compositor connection) for the whole run.
+    let mut capturer = Capturer::new(cfg.capture_backend);
+    println!("Capture: {}", capture::probe(&mut capturer, &cfg.region)?);
+    let mut capturer = Some(capturer);
 
     // Creating the device includes the settle delay (300 ms by default) so
     // the compositor has picked it up before the first event.
@@ -162,7 +166,7 @@ fn run(cfg: &Config, dry_run: bool) -> Result<(), String> {
         }
         println!("Reeling...");
         let started = Instant::now();
-        match reel::reel(cfg, &mut input) {
+        match reel::reel(cfg, &mut input, &mut capturer) {
             Ok(outcome) => println!("  {} ({:.1} s)", outcome.describe(), started.elapsed().as_secs_f32()),
             Err(e) => eprintln!("  reeling aborted: {e}"),
         }
@@ -208,7 +212,7 @@ fn countdown(secs: u64) -> bool {
 fn require_capture_tools(cfg: &Config) -> Result<(), String> {
     match cfg.capture_backend {
         CaptureBackend::Grim => require_tool("grim", "install it with `sudo pacman -S grim`"),
-        CaptureBackend::Auto | CaptureBackend::Screencopy => Ok(()),
+        CaptureBackend::Screencopy => Ok(()),
     }
 }
 

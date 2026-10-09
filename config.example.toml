@@ -52,12 +52,13 @@ height = 30
 [detect]
 # How the region is captured:
 #   "screencopy" - built-in wlr-screencopy client with one persistent
-#                  connection; one capture per monitor refresh (165/s on a
+#                  connection: one capture per monitor refresh (165/s on a
 #                  165 Hz monitor). The game's own fps (e.g. 240) doesn't
 #                  matter: only frames Hyprland actually shows can be captured.
 #   "grim"       - runs grim for every frame, ~50/s; needs `grim` installed.
-#   "auto"       - screencopy, falling back to grim if it doesn't work.
-capture_backend = "auto"
+#                  Only for troubleshooting: Hyprland 0.56 may keep a capture
+#                  session around for every grim run.
+capture_backend = "screencopy"
 
 # Minimum time between captures; 0 = as fast as the backend goes.
 capture_interval_ms = 0
