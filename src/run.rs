@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow};
 use evdev::KeyCode;
 
 use crate::capture::{self, Capturer, Frame, Rect};
-use crate::cast::{CastFinder, CastWatch};
+use crate::cast::{CastFinder, CastSession};
 use crate::config::{CastMode, Config, NavOff};
 use crate::detect::Detector;
 use crate::hypr::Hypr;
@@ -401,43 +401,37 @@ impl Macro {
 
     /// Holds the button while watching the power bar; returns how it ended.
     fn charge(&mut self, bar: &CastFinder) -> Result<String> {
-        let mut watch = CastWatch::new(&self.cfg.cast);
+        let mut session = CastSession::new(&self.cfg.cast);
         let start = Instant::now();
         let max = Duration::from_millis(self.cfg.cast.max_hold_ms);
         let timed = Duration::from_millis(self.cfg.timing.cast_hold_ms);
-        let mut bottom = None;
-        let mut seen = false;
         loop {
             self.check()?;
             let frame = self.grab_rect(bar.rect)?;
-            let reading = bar.read(&frame, bottom);
-            if let Some(r) = reading {
-                bottom = Some(r.bottom);
-                seen = true;
-            }
-            let fill = reading.map_or(0.0, |r| r.fill);
             let t = frame
                 .received
                 .saturating_duration_since(start)
                 .as_secs_f64();
-            if !seen && self.cfg.cast.mode == CastMode::Auto && start.elapsed() >= timed {
-                self.totals.fallback_casts += 1;
-                return Ok(paint(
-                    "power bar not found - timed cast; check `debug --cast`",
-                    "33",
-                ));
-            }
-            if watch.update(t, fill) {
+            let step = session.update(bar, &frame, t);
+            if step.release {
                 self.totals.bar_casts += 1;
+                let fill = step.reading.map_or(0.0, |r| r.fill);
                 return Ok(format!(
                     "power bar {:.0}% after {} ms",
                     fill * 100.0,
                     start.elapsed().as_millis()
                 ));
             }
+            if !session.seen() && self.cfg.cast.mode == CastMode::Auto && start.elapsed() >= timed {
+                self.totals.fallback_casts += 1;
+                return Ok(paint(
+                    "power bar not found - timed cast; check `debug --cast`",
+                    "33",
+                ));
+            }
             if start.elapsed() >= max {
                 self.totals.fallback_casts += 1;
-                return Ok(if watch.peak() < 0.05 {
+                return Ok(if !session.seen() {
                     paint(
                         "power bar not seen - released after max_hold_ms; check `debug --cast`",
                         "33",
@@ -446,7 +440,7 @@ impl Macro {
                     paint(
                         &format!(
                             "power bar peaked at {:.0}% (< release_at) - released after max_hold_ms",
-                            watch.peak() * 100.0
+                            session.peak() * 100.0
                         ),
                         "33",
                     )

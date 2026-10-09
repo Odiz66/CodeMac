@@ -4,11 +4,18 @@
 //! a green cap at the top and a white fill growing up from the bottom. It is
 //! attached to the character, so it shifts a little whenever the camera
 //! moves. Instead of fixed coordinates the bar is searched for in an area:
-//! first the green cap, then the white fill in the column below it.
+//! green blobs are candidates for the cap, and a candidate only counts when a
+//! white fill of the cap's width sits in the column below it.
+
+use std::collections::VecDeque;
 
 use crate::capture::{Frame, Rect};
 use crate::config::CastCfg;
-use crate::tracker::Track;
+
+/// Longest bar (cap to bottom) that is searched for, in pixels.
+const MAX_BAR_LEN: u32 = 700;
+/// After this many frames without the bar a charge counts as "bar gone".
+pub const GONE_AFTER_MISSES: u32 = 30;
 
 /// Green cap at the top of the bar.
 fn is_cap(p: [u8; 3]) -> bool {
@@ -27,10 +34,88 @@ fn is_fill(p: [u8; 3]) -> bool {
 pub struct CastReading {
     /// Filled fraction 0..1.
     pub fill: f32,
-    /// Cap position (bottom of the cap), relative to the search area.
+    /// Cap position (centre column, bottom row), relative to the search area.
     pub cap: (u32, u32),
     /// Bottom of the bar, relative to the search area.
     pub bottom: u32,
+}
+
+/// A connected group of green pixels.
+#[derive(Debug, Clone, Copy)]
+struct Blob {
+    min_x: u32,
+    max_x: u32,
+    min_y: u32,
+    max_y: u32,
+    size: u32,
+    sum_x: u64,
+}
+
+impl Blob {
+    fn center_x(&self) -> u32 {
+        (self.sum_x / self.size as u64) as u32
+    }
+    fn width(&self) -> u32 {
+        self.max_x - self.min_x + 1
+    }
+    fn height(&self) -> u32 {
+        self.max_y - self.min_y + 1
+    }
+}
+
+fn green_blobs(frame: &Frame) -> Vec<Blob> {
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let mut mask: Vec<bool> = (0..w * h)
+        .map(|i| is_cap(frame.px((i % w) as u32, (i / w) as u32)))
+        .collect();
+    let mut blobs = Vec::new();
+    let mut stack = Vec::new();
+    for start in 0..w * h {
+        if !mask[start] {
+            continue;
+        }
+        mask[start] = false;
+        stack.push(start);
+        let (sx, sy) = ((start % w) as u32, (start / w) as u32);
+        let mut b = Blob {
+            min_x: sx,
+            max_x: sx,
+            min_y: sy,
+            max_y: sy,
+            size: 0,
+            sum_x: 0,
+        };
+        while let Some(i) = stack.pop() {
+            let (x, y) = (i % w, i / w);
+            b.size += 1;
+            b.sum_x += x as u64;
+            b.min_x = b.min_x.min(x as u32);
+            b.max_x = b.max_x.max(x as u32);
+            b.min_y = b.min_y.min(y as u32);
+            b.max_y = b.max_y.max(y as u32);
+            for (dx, dy) in [
+                (-1i32, 0i32),
+                (1, 0),
+                (0, -1),
+                (0, 1),
+                (-1, -1),
+                (1, -1),
+                (-1, 1),
+                (1, 1),
+            ] {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
+                    let j = ny as usize * w + nx as usize;
+                    if mask[j] {
+                        mask[j] = false;
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        blobs.push(b);
+    }
+    blobs
 }
 
 pub struct CastFinder {
@@ -49,65 +134,64 @@ impl CastFinder {
         }
     }
 
-    /// Finds the bar in a frame of `rect`. `bottom_hint` is the lowest bottom
-    /// seen so far during this charge (the bottom of the bar never moves while
-    /// charging, but a nearly empty fill is hard to see).
-    pub fn read(&self, frame: &Frame, bottom_hint: Option<u32>) -> Option<CastReading> {
-        let mut cap: Vec<(u32, u32)> = Vec::new();
-        for y in 0..frame.height {
-            for x in 0..frame.width {
-                if is_cap(frame.px(x, y)) {
-                    cap.push((x, y));
-                }
-            }
-        }
-        if cap.len() < 4 {
-            return None;
-        }
-        let mut xs: Vec<u32> = cap.iter().map(|p| p.0).collect();
-        xs.sort_unstable();
-        let mid = xs[xs.len() / 2];
-        let near: Vec<(u32, u32)> = cap.into_iter().filter(|p| p.0.abs_diff(mid) <= 8).collect();
-        if near.len() < 4 {
-            return None;
-        }
-        let mut near_x: Vec<u32> = near.iter().map(|p| p.0).collect();
-        near_x.sort_unstable();
-        let cap_x = near_x[near_x.len() / 2];
-        let cap_y = near.iter().map(|p| p.1).max().unwrap_or(0);
+    /// Finds the bar in a frame of `rect`. `hint` is the cap column and bar
+    /// bottom found earlier in this charge: the bar barely moves while
+    /// charging, so candidates near it are tried first, readings whose bottom
+    /// jumps away from it are rejected, and an empty bar can still be read.
+    pub fn read(&self, frame: &Frame, hint: Option<(u32, u32)>) -> Option<CastReading> {
+        let mut blobs: Vec<Blob> = green_blobs(frame)
+            .into_iter()
+            .filter(|b| {
+                (4..=3000).contains(&b.size) && (3..=60).contains(&b.width()) && b.height() <= 40
+            })
+            .collect();
+        blobs.sort_by_key(|b| {
+            let near = hint.is_some_and(|(hx, _)| b.center_x().abs_diff(hx) <= 12);
+            (!near, std::cmp::Reverse(b.size))
+        });
+        blobs.iter().find_map(|b| self.measure(frame, b, hint))
+    }
 
-        // Scan the bar column (and its neighbours) from the bottom of the
-        // search area upwards: the lowest white pixel is the bottom of the
-        // fill, and the white run above it is the fill.
-        let mut runs: Vec<(u32, u32)> = Vec::new();
-        for x in [cap_x.saturating_sub(1), cap_x, cap_x + 1] {
-            if x >= frame.width {
-                continue;
-            }
-            let Some(bottom) = (cap_y + 1..frame.height)
-                .rev()
-                .find(|&y| is_fill(frame.px(x, y)))
-            else {
-                continue;
-            };
-            let mut top = bottom;
-            while top > cap_y + 1 {
-                let up = top - 1;
-                let gap_ok = up > cap_y + 1 && is_fill(frame.px(x, up - 1));
-                if is_fill(frame.px(x, up)) || gap_ok {
-                    top = up;
-                } else {
-                    break;
+    /// Checks the column below a green blob for a bar and measures its fill.
+    fn measure(&self, frame: &Frame, cap: &Blob, hint: Option<(u32, u32)>) -> Option<CastReading> {
+        let cx = cap.center_x();
+        let cap_y = cap.max_y;
+        let cap_w = cap.width();
+        if cap_y + 1 >= frame.height {
+            return None;
+        }
+        let same_bar = hint.filter(|&(hx, _)| hx.abs_diff(cx) <= 12);
+        // Once the bottom of this bar is known, nothing below it is searched.
+        let mut end = (cap_y + MAX_BAR_LEN).min(frame.height - 1);
+        if let Some((_, hb)) = same_bar {
+            end = end.min(hb + 8);
+        }
+
+        // The fill top is the first row below the cap with a white run about
+        // as wide as the cap; anything much wider (clothes, foam) is not the bar.
+        let top = (cap_y + 1..=end).find(|&y| self.is_fill_row(frame, cx, y, cap_w));
+        let (top, bottom) = match top {
+            Some(top) => {
+                let mut bottom = top;
+                let mut y = top + 1;
+                while y <= end {
+                    if self.is_fill_row(frame, cx, y, cap_w) {
+                        bottom = y;
+                    } else if !(y < end && self.is_fill_row(frame, cx, y + 1, cap_w)) {
+                        break;
+                    }
+                    y += 1;
+                }
+                match same_bar {
+                    // The bottom of a bar does not move during a charge: a
+                    // white run ending elsewhere is something else.
+                    Some((_, hb)) if bottom.abs_diff(hb) > 8 => (hb + 1, hb),
+                    _ => (top, bottom),
                 }
             }
-            runs.push((bottom, top));
-        }
-        runs.sort_unstable();
-        let (bottom, top) = match runs.get(runs.len() / 2) {
-            Some(&(b, t)) => (b.max(bottom_hint.unwrap_or(0)), t),
             None => {
-                let b = bottom_hint?;
-                (b, b + 1)
+                let (_, hb) = same_bar?;
+                (hb + 1, hb)
             }
         };
         if bottom <= cap_y + 20 {
@@ -117,9 +201,26 @@ impl CastFinder {
         let fill = ((bottom + 1).saturating_sub(top) as f32 / len).clamp(0.0, 1.0);
         Some(CastReading {
             fill,
-            cap: (cap_x, cap_y),
+            cap: (cx, cap_y),
             bottom,
         })
+    }
+
+    fn is_fill_row(&self, frame: &Frame, cx: u32, y: u32, cap_w: u32) -> bool {
+        if cx >= frame.width || y >= frame.height || !is_fill(frame.px(cx, y)) {
+            return false;
+        }
+        let limit = cap_w * 2 + 4;
+        let mut l = cx;
+        while l > 0 && cx - l < limit && is_fill(frame.px(l - 1, y)) {
+            l -= 1;
+        }
+        let mut r = cx;
+        while r + 1 < frame.width && r - cx < limit && is_fill(frame.px(r + 1, y)) {
+            r += 1;
+        }
+        let width = r - l + 1;
+        width >= (cap_w * 4 / 10).max(2) && width <= cap_w * 16 / 10 + 3
     }
 }
 
@@ -127,13 +228,17 @@ impl CastFinder {
 pub struct CastWatch {
     release_at: f32,
     lead_s: f64,
-    track: Track,
+    /// Recent (time, fill) samples.
+    recent: VecDeque<(f64, f32)>,
+    /// Consecutive frames that called for a release.
+    ready: u32,
     /// The bar has been seen nearly empty since the button went down, so a
     /// bar still full from the previous cast cannot trigger a release.
     armed: bool,
     seen: bool,
     peak: f32,
     peak_passed: bool,
+    drops: u32,
 }
 
 impl CastWatch {
@@ -141,18 +246,23 @@ impl CastWatch {
         CastWatch {
             release_at: cfg.release_at,
             lead_s: cfg.lead_ms as f64 / 1000.0,
-            track: Track::new(3, 1),
+            recent: VecDeque::with_capacity(6),
+            ready: 0,
             armed: false,
             seen: false,
             peak: 0.0,
             peak_passed: false,
+            drops: 0,
         }
     }
 
     /// Feed one measurement taken `t` seconds after pressing; returns true
     /// when the button should be released now.
     pub fn update(&mut self, t: f64, fill: f32) -> bool {
-        self.track.push(t, fill as f64);
+        self.recent.push_back((t, fill));
+        if self.recent.len() > 5 {
+            self.recent.pop_front();
+        }
         if fill < 0.3 {
             self.armed = true;
         }
@@ -164,20 +274,116 @@ impl CastWatch {
         }
         self.peak = self.peak.max(fill);
         // A bar that swings back down before reaching release_at oscillates:
-        // aim for just below the peak it actually reaches.
+        // aim for just below the peak it actually reaches. Two frames in a row
+        // must show the drop, so one bad reading cannot trigger it.
         if self.peak >= 0.5 && fill < self.peak - 0.08 {
-            self.peak_passed = true;
+            self.drops += 1;
+            if self.drops >= 2 {
+                self.peak_passed = true;
+            }
+        } else {
+            self.drops = 0;
         }
-        let rate = self.track.motion().map_or(0.0, |m| m.v);
-        let predicted = fill as f64 + rate.max(0.0) * self.lead_s;
-        if predicted >= self.release_at as f64 {
-            return true;
+        let rate = self.rate();
+        // The two-frame confirmation below costs one frame: look that much further.
+        let frame_dt = match (self.recent.front(), self.recent.back()) {
+            (Some(a), Some(b)) if self.recent.len() > 1 => {
+                (b.0 - a.0) / (self.recent.len() - 1) as f64
+            }
+            _ => 0.0,
+        };
+        let predicted = fill as f64 + rate.max(0.0) * (self.lead_s + frame_dt);
+        let want = predicted >= self.release_at as f64
+            || (self.peak_passed
+                && self.drops == 0
+                && rate > 0.0
+                && predicted >= (self.peak - 0.03) as f64);
+        // Two frames in a row, so a single wrong reading cannot release early.
+        self.ready = if want { self.ready + 1 } else { 0 };
+        self.ready >= 2
+    }
+
+    /// Fill speed per second: the median of the slopes between all pairs of
+    /// recent samples, so one wrong reading barely moves it.
+    fn rate(&self) -> f64 {
+        let s: Vec<(f64, f32)> = self.recent.iter().copied().collect();
+        let mut slopes = Vec::new();
+        for i in 0..s.len() {
+            for j in i + 1..s.len() {
+                let dt = s[j].0 - s[i].0;
+                if dt > 1e-6 {
+                    slopes.push((s[j].1 - s[i].1) as f64 / dt);
+                }
+            }
         }
-        self.peak_passed && rate > 0.0 && predicted >= (self.peak - 0.03) as f64
+        if slopes.is_empty() {
+            return 0.0;
+        }
+        slopes.sort_by(|a, b| a.total_cmp(b));
+        slopes[slopes.len() / 2]
     }
 
     pub fn peak(&self) -> f32 {
         self.peak
+    }
+}
+
+/// One charge: finder + release decision, shared by `run` and `debug --cast`
+/// so both behave the same.
+pub struct CastSession {
+    watch: CastWatch,
+    hint: Option<(u32, u32)>,
+    seen: bool,
+    misses: u32,
+}
+
+pub struct CastStep {
+    pub reading: Option<CastReading>,
+    pub release: bool,
+}
+
+impl CastSession {
+    pub fn new(cfg: &CastCfg) -> CastSession {
+        CastSession {
+            watch: CastWatch::new(cfg),
+            hint: None,
+            seen: false,
+            misses: 0,
+        }
+    }
+
+    /// The bar has been found at least once during this charge.
+    pub fn seen(&self) -> bool {
+        self.seen
+    }
+
+    /// Frames in a row without the bar.
+    pub fn misses(&self) -> u32 {
+        self.misses
+    }
+
+    pub fn peak(&self) -> f32 {
+        self.watch.peak()
+    }
+
+    pub fn update(&mut self, finder: &CastFinder, frame: &Frame, t: f64) -> CastStep {
+        let reading = finder.read(frame, self.hint);
+        let release = match reading {
+            Some(r) => {
+                self.hint = Some((r.cap.0, r.bottom));
+                self.seen = true;
+                self.misses = 0;
+                self.watch.update(t, r.fill)
+            }
+            None => {
+                self.misses += 1;
+                // Before the bar shows up "not visible" means empty (this arms
+                // the watch). Afterwards a missed frame is just skipped: it
+                // must not look like the fill dropped to zero.
+                !self.seen && self.watch.update(t, 0.0)
+            }
+        };
+        CastStep { reading, release }
     }
 }
 
@@ -197,16 +403,8 @@ mod tests {
             }
         }
         // Some cyan rod sparkle, which must not count as fill.
-        for y in 300..340 {
-            for x in 40..60 {
-                f.set(x, y, [120, 240, 255]);
-            }
-        }
-        for y in cap_top..cap_top + 6 {
-            for x in cap_x - 5..cap_x + 5 {
-                f.set(x, y, [81, 141, 66]);
-            }
-        }
+        rect(&mut f, 40, 300, 20, 40, [120, 240, 255]);
+        rect(&mut f, cap_x - 5, cap_top, 10, 6, [81, 141, 66]);
         let body_top = cap_top + 6;
         let len = bottom - (cap_top + 5);
         let fill_top = bottom + 1 - (len as f32 * fill).round() as u32;
@@ -226,6 +424,14 @@ mod tests {
         f
     }
 
+    fn rect(f: &mut Frame, x0: u32, y0: u32, w: u32, h: u32, c: [u8; 3]) {
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                f.set(x, y, c);
+            }
+        }
+    }
+
     #[test]
     fn reads_the_fill() {
         let finder = CastFinder::new(&CastCfg::default());
@@ -241,18 +447,14 @@ mod tests {
         let finder = CastFinder::new(&CastCfg::default());
         let r = finder.read(&scene(330, 40, 420, 0.5), None).unwrap();
         assert!((r.fill - 0.5).abs() < 0.02);
-        assert_eq!(r.cap.0, 330);
+        assert!(r.cap.0.abs_diff(330) <= 1);
     }
 
     #[test]
     fn nothing_without_a_bar() {
         let finder = CastFinder::new(&CastCfg::default());
         let mut f = scene(200, 100, 400, 0.5);
-        for y in 90..420 {
-            for x in 190..210 {
-                f.set(x, y, [30, 28, 70]);
-            }
-        }
+        rect(&mut f, 190, 90, 20, 330, [30, 28, 70]);
         assert_eq!(finder.read(&f, None), None);
     }
 
@@ -261,8 +463,67 @@ mod tests {
         let finder = CastFinder::new(&CastCfg::default());
         let f = scene(200, 100, 400, 0.0);
         assert_eq!(finder.read(&f, None), None);
-        let r = finder.read(&f, Some(400)).unwrap();
+        let r = finder.read(&f, Some((200, 400))).unwrap();
         assert!(r.fill < 0.01);
+    }
+
+    #[test]
+    fn green_speck_next_to_the_bar_is_ignored() {
+        let finder = CastFinder::new(&CastCfg::default());
+        let mut f = scene(200, 100, 400, 0.3);
+        rect(&mut f, 206, 330, 2, 2, [70, 150, 60]);
+        let r = finder.read(&f, None).unwrap();
+        assert!((r.fill - 0.3).abs() < 0.02, "{}", r.fill);
+    }
+
+    #[test]
+    fn grass_elsewhere_does_not_hide_the_bar() {
+        let finder = CastFinder::new(&CastCfg::default());
+        let mut f = scene(200, 100, 400, 0.5);
+        rect(&mut f, 0, 560, 60, 40, [70, 140, 60]);
+        rect(&mut f, 300, 20, 40, 30, [60, 150, 50]);
+        let r = finder.read(&f, None).unwrap();
+        assert!((r.fill - 0.5).abs() < 0.02, "{}", r.fill);
+    }
+
+    #[test]
+    fn white_things_below_the_bar_are_ignored() {
+        let finder = CastFinder::new(&CastCfg::default());
+        // A wide white object (clothes) below the bar.
+        let mut f = scene(200, 100, 400, 0.5);
+        rect(&mut f, 150, 600, 120, 6, [240, 240, 240]);
+        let r = finder.read(&f, None).unwrap();
+        assert!((r.fill - 0.5).abs() < 0.02, "{}", r.fill);
+        // A bar-wide glint far below is rejected once the bottom is known.
+        let mut g = scene(200, 100, 400, 0.0);
+        rect(&mut g, 195, 600, 10, 6, [240, 240, 240]);
+        let r = finder.read(&g, Some((200, 400))).unwrap();
+        assert!(r.fill < 0.01, "{}", r.fill);
+    }
+
+    #[test]
+    fn a_missed_frame_does_not_release_early() {
+        let cfg = CastCfg::default();
+        let finder = CastFinder::new(&cfg);
+        let mut s = CastSession::new(&cfg);
+        let blank = Frame::new(420, 660);
+        let mut released_at = None;
+        for i in 0..400 {
+            let t = i as f64 / 165.0;
+            let fill = (t * 0.9) as f32;
+            // The bar is missed for two frames at ~33 % and one at ~43 %.
+            let frame = if [60, 61, 79].contains(&i) {
+                blank.clone()
+            } else {
+                scene(200, 100, 400, fill.min(1.0))
+            };
+            if s.update(&finder, &frame, t).release {
+                released_at = Some(fill);
+                break;
+            }
+        }
+        let fill = released_at.unwrap();
+        assert!(fill > 0.9, "released at {fill}");
     }
 
     #[test]
@@ -313,6 +574,25 @@ mod tests {
         // Missed the first peak, released on the way up to the second one.
         assert!(t > 2.0 && t < 3.0, "{t}");
         assert!(fill > 0.82, "{fill}");
+    }
+
+    #[test]
+    fn a_single_bad_reading_does_not_count_as_a_peak() {
+        let cfg = CastCfg::default();
+        let mut w = CastWatch::new(&cfg);
+        let mut released = None;
+        for i in 0..200 {
+            let t = i as f64 / 165.0;
+            let mut fill = (t * 0.9) as f32;
+            if i == 90 {
+                fill = 0.1; // one wrong value at ~49 %
+            }
+            if w.update(t, fill.min(1.0)) {
+                released = Some((t * 0.9) as f32);
+                break;
+            }
+        }
+        assert!(released.unwrap() > 0.9, "{released:?}");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::capture::{self, Capturer, Frame, Grim, Rect, Screencopy};
-use crate::cast::{CastFinder, CastWatch};
+use crate::cast::{CastFinder, CastSession, GONE_AFTER_MISSES};
 use crate::config::Config;
 use crate::detect::{Detector, Layout};
 use crate::hypr::Hypr;
@@ -374,7 +374,8 @@ fn full_screenshot(cfg: &Config, out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `debug --cast`: prints what the power bar finder sees while you charge casts by hand.
+/// `debug --cast`: prints what the power bar finder sees while you charge
+/// casts by hand, using the same per-frame logic as the real cast.
 fn watch_cast(cfg: &Config, flags: &Flags, frames: u64, out: &Path) -> Result<()> {
     let finder = CastFinder::new(&cfg.cast);
     let mut cap = capture::open(&cfg.capture, Some(finder.rect))?;
@@ -383,45 +384,54 @@ fn watch_cast(cfg: &Config, flags: &Flags, frames: u64, out: &Path) -> Result<()
         finder.rect
     );
     println!("\"RELEASE\" marks the frame where the macro would let go.");
-    let mut watch: Option<(CastWatch, Instant, bool, u32)> = None;
+    let mut session: Option<(CastSession, Instant, bool)> = None;
     let mut n = 0u64;
     let mut saved = false;
     while !flags.quitting() && (frames == 0 || n < frames) {
         let frame = cap.grab(finder.rect)?;
         n += 1;
-        let hint = watch.as_ref().map(|w| w.3);
-        let Some(r) = finder.read(&frame, hint) else {
-            if let Some((w, ..)) = watch.take() {
-                println!("--- bar gone (peak {:.0}%) ---", w.peak() * 100.0);
-            }
-            continue;
-        };
-        if watch.is_none() {
-            watch = Some((CastWatch::new(&cfg.cast), frame.received, false, r.bottom));
-            println!(
-                "--- power bar found at {},{} (cap) - {} px tall ---",
-                finder.rect.x + r.cap.0 as i32,
-                finder.rect.y + r.cap.1 as i32,
-                r.bottom - r.cap.1
-            );
-            if !saved {
-                save_png(&out.join("cast_found.png"), &frame)?;
-                saved = true;
-            }
-        }
-        let (w, t0, released, bottom) = watch.as_mut().expect("just set");
-        *bottom = (*bottom).max(r.bottom);
+        let (s, t0, released) =
+            session.get_or_insert_with(|| (CastSession::new(&cfg.cast), frame.received, false));
         let t = frame.received.duration_since(*t0).as_secs_f64();
-        let mut line = format!(
-            "{:6.1}% {}",
-            r.fill * 100.0,
-            "#".repeat((r.fill * 40.0).round() as usize)
-        );
-        if w.update(t, r.fill) && !*released {
-            *released = true;
-            line.push_str(&format!("   <-- RELEASE ({} ms)", (t * 1000.0).round()));
+        let step = s.update(&finder, &frame, t);
+        match step.reading {
+            Some(r) => {
+                if s.misses() == 0 && !saved {
+                    save_png(&out.join("cast_found.png"), &frame)?;
+                    saved = true;
+                    println!(
+                        "--- power bar found: cap at {},{}, {} px tall ---",
+                        finder.rect.x + r.cap.0 as i32,
+                        finder.rect.y + r.cap.1 as i32,
+                        r.bottom - r.cap.1
+                    );
+                }
+                let mut line = format!(
+                    "{:6.1}% {}",
+                    r.fill * 100.0,
+                    "#".repeat((r.fill * 40.0).round() as usize)
+                );
+                if step.release && !*released {
+                    *released = true;
+                    line.push_str(&format!("   <-- RELEASE ({} ms)", (t * 1000.0).round()));
+                }
+                println!("{line}");
+            }
+            None if s.seen() => {
+                if s.misses() == 1 {
+                    println!("   -- not found this frame");
+                }
+                if s.misses() >= GONE_AFTER_MISSES {
+                    println!("--- bar gone (peak {:.0}%) ---", s.peak() * 100.0);
+                    session = None;
+                    saved = false;
+                }
+            }
+            None => {
+                // Not charging: start the next charge fresh.
+                session = None;
+            }
         }
-        println!("{line}");
     }
     Ok(())
 }

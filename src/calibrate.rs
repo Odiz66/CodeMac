@@ -39,16 +39,16 @@ pub struct Args {
     #[arg(long)]
     manual: bool,
     /// --manual: seconds before each cursor position is read (0 = wait for F6).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, requires = "manual")]
     countdown: u64,
     /// --manual: only redo one part.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, requires = "manual")]
     only: Option<Part>,
     /// --manual: do not set up progress-bar reading.
-    #[arg(long)]
+    #[arg(long, requires = "manual")]
     no_progress: bool,
     /// --manual: frames captured for the colour analysis.
-    #[arg(long, default_value_t = 90)]
+    #[arg(long, default_value_t = 90, requires = "manual")]
     frames: usize,
     /// Pick colours from a saved PNG (from debug/ or calibration/) instead of live.
     #[arg(long, value_name = "FILE")]
@@ -211,17 +211,42 @@ pub fn looks_like_minigame(frame: &Frame, layout: &Layout) -> bool {
         let w = r.end - r.start + 1;
         w * 100 >= n * 6 && w * 100 <= n * 75
     });
-    dark * 100 >= n * 30 && wide
+    dark * 100 >= n * 30 && wide && progress_visible(frame, layout)
+}
+
+/// The progress bar under the track: some row near the expected one is
+/// white at its left end (the fill always starts there). True when no
+/// progress bar is configured.
+fn progress_visible(frame: &Frame, layout: &Layout) -> bool {
+    let Some(p) = layout.progress else {
+        return true;
+    };
+    let k = ((p.x1 - p.x0 + 1) / 50).max(4);
+    let lo = p.y.saturating_sub(8);
+    let hi = (p.y + 8).min(frame.height.saturating_sub(1));
+    (lo..=hi).any(|y| {
+        let lit = (p.x0 + 3..p.x0 + 3 + k)
+            .filter(|&x| x < frame.width && luma(frame.px(x, y)) >= 170)
+            .count();
+        lit * 10 >= k as usize * 8
+    })
 }
 
 /// Automatic calibration: wait for a minigame the user plays by hand, record
 /// it and learn the colours. The positions are the built-in defaults.
 fn calibrate_auto(ctx: &Ctx, cap: &mut dyn Capturer, cfg: &mut Config) -> Result<()> {
     // Capture a little more around the progress bar so its row can be refined.
-    let wide_cfg = crate::config::LayoutCfg {
+    // If progress reading was switched off before, search at the default row.
+    let defaults = crate::config::LayoutCfg::default();
+    let mut wide_cfg = crate::config::LayoutCfg {
         padding: 16,
         ..cfg.layout.clone()
     };
+    if wide_cfg.progress_y == 0 {
+        wide_cfg.progress_y = defaults.progress_y;
+        wide_cfg.progress_left = defaults.progress_left;
+        wide_cfg.progress_right = defaults.progress_right;
+    }
     let layout = Layout::from_config(&wide_cfg)?;
     let msg = "Calibration: catch a fish by hand. I record the reel minigame by myself.";
     println!("\n{msg}");
@@ -248,17 +273,35 @@ fn calibrate_auto(ctx: &Ctx, cap: &mut dyn Capturer, cfg: &mut Config) -> Result
     println!("Minigame found - recording 5 s, keep playing...");
     ctx.hypr
         .notify("Minigame found - keep playing (recording 5 s)", 5_000);
+    // Keep only frames that show the minigame; stop when it is over.
     let t = Instant::now();
     let mut frames: Vec<Frame> = Vec::new();
     let mut last: Option<Instant> = None;
-    while t.elapsed() < Duration::from_secs(5) {
+    let mut gone = 0;
+    while t.elapsed() < Duration::from_secs(5) && gone < 40 {
         let f = cap.grab(layout.capture)?;
+        if !looks_like_minigame(&f, &layout) {
+            gone += 1;
+            continue;
+        }
+        gone = 0;
         if last.is_none_or(|l| f.received.duration_since(l) >= Duration::from_millis(20)) {
             last = Some(f.received);
             frames.push(f);
         }
     }
-    println!("  recorded {} frames", frames.len());
+    println!("  recorded {} minigame frames", frames.len());
+    if frames.len() < 40 {
+        ctx.hypr.notify(
+            "Calibration: the minigame was too short - run it again",
+            8_000,
+        );
+        bail!(
+            "only {} frames of the minigame were recorded (need ~1 s). Nothing was saved; \
+             run calibrate again and keep the fish on the line a little longer",
+            frames.len()
+        );
+    }
 
     let dir = Path::new("calibration");
     for (i, f) in frames.iter().enumerate().step_by(10) {
@@ -274,11 +317,14 @@ fn calibrate_auto(ctx: &Ctx, cap: &mut dyn Capturer, cfg: &mut Config) -> Result
     println!("  progress:   {}", list(&a.progress));
     cfg.colors.bar = a.bar.iter().map(|(c, _)| *c).collect();
     cfg.colors.fish = a.fish.iter().map(|(c, _)| *c).collect();
-    cfg.colors.progress = a.progress.clone();
-    cfg.layout.progress_y = match a.progress_row {
-        Some(y) => layout.capture.y + y as i32,
-        None => 0,
-    };
+    if let Some(y) = a.progress_row {
+        cfg.colors.progress = a.progress.clone();
+        cfg.layout.progress_y = layout.capture.y + y as i32;
+        cfg.layout.progress_left = wide_cfg.progress_left;
+        cfg.layout.progress_right = wide_cfg.progress_right;
+    } else {
+        println!("  note: kept the previous progress bar settings");
+    }
 
     let mut det = Detector::with_layout(layout.clone(), &cfg.colors, &cfg.detection)?;
     let (mut bar_hits, mut fish_hits) = (0, 0);
@@ -299,12 +345,23 @@ fn calibrate_auto(ctx: &Ctx, cap: &mut dyn Capturer, cfg: &mut Config) -> Result
     if pct(bar_hits) >= 80.0 && pct(fish_hits) >= 80.0 {
         ctx.hypr
             .notify("Calibration done! Go back to the terminal.", 6_000);
-    } else {
-        println!("  Detection looks weak. Send this output and calibration/check.png for help,");
-        println!("  or run calibrate again during a longer minigame.");
+    } else if pct(bar_hits) >= 50.0 && pct(fish_hits) >= 50.0 {
+        println!("  Detection is only fair. Saved anyway; if the macro loses the fish, run");
+        println!("  calibrate again during a longer minigame.");
         ctx.hypr.notify(
-            "Calibration finished, detection looks weak - see the terminal",
+            "Calibration saved, but detection is only fair - see the terminal",
             8_000,
+        );
+    } else {
+        ctx.hypr.notify(
+            "Calibration failed - nothing saved, see the terminal",
+            8_000,
+        );
+        bail!(
+            "detection with the learned colours is too weak (bar {:.0}%, fish {:.0}%). Nothing \
+             was saved. Send this output and calibration/check.png for help.",
+            pct(bar_hits),
+            pct(fish_hits)
         );
     }
     Ok(())
@@ -363,31 +420,37 @@ pub fn analyze_auto(
         28.0,
     );
 
-    // 2. Your bar: wide runs of bright columns.
+    // 2. Your bar: wide runs of bright columns. The colour is decided per
+    //    frame (the bar is one colour at a time: white with the fish inside,
+    //    brown with it outside), so a colour seen only briefly still counts.
     let half = rows.len().div_ceil(2);
     let mut cols = vec![false; n];
-    let mut bar_px = Vec::new();
+    let mut per_frame = Vec::new();
     for f in frames {
         for (i, x) in xs().enumerate() {
             cols[i] = rows.iter().filter(|&&y| luma(f.px(x, y)) >= 80).count() >= half;
         }
-        for r in runs(&cols, 3)
-            .into_iter()
-            .filter(|r| (r.end - r.start + 1) * 100 >= n * 5)
-        {
+        let mut px = Vec::new();
+        for r in runs(&cols, 3).into_iter().filter(|r| {
+            let w = r.end - r.start + 1;
+            w * 100 >= n * 5 && w * 100 <= n * 75
+        }) {
             for i in r.start..=r.end {
                 for &y in &rows {
                     let p = f.px(layout.track_x0 + i as u32, y);
                     if luma(p) >= 80 {
-                        bar_px.push(p);
+                        px.push(p);
                     }
                 }
             }
         }
+        if let Some(&(c, _)) = clusters(&px, 24.0, 1).first() {
+            per_frame.push(c);
+        }
     }
-    let bar: Vec<(Rgb, f32)> = clusters(&bar_px, 24.0, 6)
+    let bar: Vec<(Rgb, f32)> = clusters(&per_frame, 24.0, 4)
         .into_iter()
-        .filter(|(_, s)| *s >= 0.05)
+        .filter(|(_, s)| *s * per_frame.len() as f32 >= 3.0)
         .take(3)
         .map(|(c, s)| (Rgb(c), s))
         .collect();
@@ -580,7 +643,7 @@ fn calibrate_colors(
         || ry > layout.track_y1 as i32 + 3
     {
         bail!(
-            "the cursor ({cx},{cy}) is not on the reel track; redo positions with `calibrate --only region`"
+            "the cursor ({cx},{cy}) is not on the reel track; redo positions with `calibrate --manual --only region`"
         );
     }
 
@@ -1139,5 +1202,48 @@ mod tests {
         assert!(!looks_like_minigame(&f, &layout));
         let dark = Frame::new(rock.width, rock.height);
         assert!(!looks_like_minigame(&dark, &layout));
+    }
+
+    #[test]
+    fn a_briefly_brown_bar_is_still_learned() {
+        let layout = fisch_layout();
+        let n = layout.track_width() as u32;
+        // The fish is outside the bar (brown) in only 4 of 120 frames.
+        let frames: Vec<Frame> = (0..120)
+            .map(|i| {
+                let bar_left = 100 + (i % 60) * 6;
+                let fish = if (50..54).contains(&i) {
+                    (bar_left + 500).min(n - 10)
+                } else {
+                    bar_left + 150
+                };
+                fisch_frame(&layout, (bar_left, bar_left + 390), fish, 0.3, i)
+            })
+            .collect();
+        let cfg = Config::default();
+        let a = analyze_auto(&frames, &layout, &cfg.colors, cfg.detection.fish_max_width).unwrap();
+        let has = |c: [u8; 3]| {
+            a.bar
+                .iter()
+                .any(|(x, _)| dist_sq(x.0, [c[0] as i32, c[1] as i32, c[2] as i32]) < 200)
+        };
+        assert!(has([239, 239, 239]) && has([138, 90, 58]), "{:?}", a.bar);
+    }
+
+    #[test]
+    fn bright_object_in_a_dark_scene_is_not_a_minigame() {
+        let layout = fisch_layout();
+        let mut f = Frame::new(layout.capture.w as u32, layout.capture.h as u32);
+        for y in 0..f.height {
+            for x in 0..f.width {
+                f.set(x, y, [15, 20, 30]);
+            }
+        }
+        for y in layout.track_y0..=layout.track_y1 {
+            for x in layout.track_x0 + 300..layout.track_x0 + 450 {
+                f.set(x, y, [200, 200, 200]);
+            }
+        }
+        assert!(!looks_like_minigame(&f, &layout));
     }
 }

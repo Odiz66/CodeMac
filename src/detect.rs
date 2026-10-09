@@ -33,7 +33,7 @@ impl Layout {
     pub fn from_config(l: &LayoutCfg) -> Result<Layout> {
         if !l.is_calibrated() {
             bail!(
-                "the reel bar position is not calibrated yet; run `cargo run --release -- calibrate` first"
+                "the reel bar position is not set; run `cargo run --release -- calibrate --manual --only region`"
             );
         }
         let progress = (l.progress_y > 0).then(|| {

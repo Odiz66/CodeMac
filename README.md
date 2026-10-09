@@ -110,8 +110,9 @@ The prediction scales with the measured capture rate by itself
   the default `KEY_BACKSLASH` is right.
 - The rod is expected in **hotbar slot 1** (`keys.reequip = "KEY_1"`): after a
   timeout it is unequipped and re-equipped to cancel a stuck cast.
-- Keep Sober fullscreen at the same resolution. If you change the resolution,
-  UI scale or window mode, the bar moves and you need to recalibrate.
+- Keep Sober fullscreen at 2560x1440. The built-in positions are for that
+  size; for another resolution, UI scale or window mode see
+  [Other screen sizes](#other-screen-sizes).
 - Keep screen shaders, hyprsunset/night light and HDR the same as during
   calibration (or off).
 
@@ -138,8 +139,13 @@ edges, red at the fish, yellow track outline).
 The power bar needs no calibration: while charging, the macro looks for its
 green cap and white fill next to your character (`[cast]` search area).
 
-Other screen sizes or UI scales: `calibrate --manual` asks you to hover the
-reel bar corners and press F6 for each.
+### Other screen sizes
+
+1. `cargo run --release -- calibrate --manual --only region`: hover the reel
+   bar corners and the progress bar ends, pressing F6 for each.
+2. `cargo run --release -- calibrate`: learns the colours as above.
+3. Move `cast.search_x/y/w/h` so the area next to your character is covered;
+   `debug --full` draws it (orange box) on a screenshot.
 
 **Manual colour picking** (e.g. the fish was missed): open a saved PNG in an
 image viewer, note pixel coordinates, then run:
