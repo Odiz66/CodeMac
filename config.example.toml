@@ -1,7 +1,7 @@
 # fisch-macro configuration.
-# `cargo run --release -- calibrate` rewrites [layout], [colors] and the power-bar
-# part of [cast]; everything else is yours to tune. Coordinates are screen
-# pixels as printed by `hyprctl cursorpos`.
+# `cargo run --release -- calibrate` rewrites [colors] (and the progress row in
+# [layout]); everything else is yours to tune. Coordinates are screen pixels as
+# printed by `hyprctl cursorpos`.
 
 [window]
 # Window class of Roblox (check with `hyprctl clients`).
@@ -24,16 +24,17 @@ output = ""
 frame_timeout_ms = 500
 
 [layout]
-# Reel track (the moving-bar area), inclusive screen coordinates.
-track_left = 0
-track_top = 0
-track_right = 0
-track_bottom = 0
+# Reel track (the moving-bar area), inclusive screen coordinates. The defaults
+# are Fisch's reel UI on a 2560x1440 screen; `calibrate --manual` re-measures.
+track_left = 764
+track_top = 1219
+track_right = 1796
+track_bottom = 1258
 # Progress bar row under the track. progress_y = 0 disables progress reading.
 # progress_left/right = 0 means "same as the track".
-progress_y = 0
-progress_left = 0
-progress_right = 0
+progress_y = 1315
+progress_left = 1004
+progress_right = 1555
 # Extra pixels captured around everything above.
 padding = 6
 
@@ -105,17 +106,18 @@ edge_guard = 0.3
 coast_ms = 150.0
 
 [cast]
-# "perfect": watch the power bar while charging and release at the top.
-# "timed": hold for timing.cast_hold_ms. "auto": perfect once the bar is calibrated.
+# While charging, the power bar (green cap on top, white fill growing from the
+# bottom) is searched for next to the character and LMB is released at the top.
+# "auto": like perfect, but a cast whose bar is not found within
+#         timing.cast_hold_ms is released then (a plain timed cast).
+# "perfect": always wait for the bar (up to max_hold_ms).
+# "timed": never look, just hold for timing.cast_hold_ms.
 mode = "auto"
-# Screen points at the empty end and at the full end of the power bar
-# (`calibrate --only cast` sets them and the fill colours).
-empty_x = 0
-empty_y = 0
-full_x = 0
-full_y = 0
-fill = []
-tolerance = 45.0
+# Screen area searched for the power bar (it moves a little with the camera).
+search_x = 1300
+search_y = 500
+search_w = 420
+search_h = 660
 # Release once the predicted fill reaches this fraction of the bar.
 release_at = 0.96
 # Release this much earlier to cover capture + input latency.

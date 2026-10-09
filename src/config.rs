@@ -189,14 +189,16 @@ pub struct LayoutCfg {
 
 impl Default for LayoutCfg {
     fn default() -> Self {
+        // Fisch's reel UI on a 2560x1440 screen (measured from screenshots);
+        // `calibrate` refines the progress row.
         Self {
-            track_left: 0,
-            track_top: 0,
-            track_right: 0,
-            track_bottom: 0,
-            progress_y: 0,
-            progress_left: 0,
-            progress_right: 0,
+            track_left: 764,
+            track_top: 1219,
+            track_right: 1796,
+            track_bottom: 1258,
+            progress_y: 1315,
+            progress_left: 1004,
+            progress_right: 1555,
             padding: 6,
         }
     }
@@ -238,12 +240,10 @@ impl Default for ColorsCfg {
 #[serde(default, deny_unknown_fields)]
 pub struct CastCfg {
     pub mode: CastMode,
-    pub empty_x: i32,
-    pub empty_y: i32,
-    pub full_x: i32,
-    pub full_y: i32,
-    pub fill: Vec<Rgb>,
-    pub tolerance: f32,
+    pub search_x: i32,
+    pub search_y: i32,
+    pub search_w: i32,
+    pub search_h: i32,
     pub release_at: f32,
     pub lead_ms: f32,
     pub max_hold_ms: u64,
@@ -251,27 +251,18 @@ pub struct CastCfg {
 
 impl Default for CastCfg {
     fn default() -> Self {
+        // The power bar floats next to the character, right of the screen
+        // centre on a 2560x1440 screen.
         Self {
             mode: CastMode::Auto,
-            empty_x: 0,
-            empty_y: 0,
-            full_x: 0,
-            full_y: 0,
-            fill: Vec::new(),
-            tolerance: 45.0,
+            search_x: 1300,
+            search_y: 500,
+            search_w: 420,
+            search_h: 660,
             release_at: 0.96,
             lead_ms: 20.0,
             max_hold_ms: 3000,
         }
-    }
-}
-
-impl CastCfg {
-    pub fn is_calibrated(&self) -> bool {
-        let len = (self.full_x - self.empty_x)
-            .abs()
-            .max((self.full_y - self.empty_y).abs());
-        len >= 10 && self.empty_y > 0 && !self.fill.is_empty()
     }
 }
 
@@ -445,9 +436,17 @@ impl Config {
         }
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Config =
+        let mut table: toml::Table =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let migrated = migrate(&mut table);
+        let cfg: Config = toml::Value::Table(table)
+            .try_into()
+            .with_context(|| format!("parsing {}", path.display()))?;
         cfg.validate()?;
+        if migrated {
+            cfg.save(path)?;
+            println!("Updated {} to the current format.", path.display());
+        }
         Ok(cfg)
     }
 
@@ -505,9 +504,9 @@ impl Config {
         let _ = write!(
             s,
             r#"# fisch-macro configuration.
-# `cargo run --release -- calibrate` rewrites [layout], [colors] and the power-bar
-# part of [cast]; everything else is yours to tune. Coordinates are screen
-# pixels as printed by `hyprctl cursorpos`.
+# `cargo run --release -- calibrate` rewrites [colors] (and the progress row in
+# [layout]); everything else is yours to tune. Coordinates are screen pixels as
+# printed by `hyprctl cursorpos`.
 
 [window]
 # Window class of Roblox (check with `hyprctl clients`).
@@ -530,7 +529,8 @@ output = {output}
 frame_timeout_ms = {frame_timeout_ms}
 
 [layout]
-# Reel track (the moving-bar area), inclusive screen coordinates.
+# Reel track (the moving-bar area), inclusive screen coordinates. The defaults
+# are Fisch's reel UI on a 2560x1440 screen; `calibrate --manual` re-measures.
 track_left = {track_left}
 track_top = {track_top}
 track_right = {track_right}
@@ -611,17 +611,18 @@ edge_guard = {edge_guard}
 coast_ms = {coast_ms}
 
 [cast]
-# "perfect": watch the power bar while charging and release at the top.
-# "timed": hold for timing.cast_hold_ms. "auto": perfect once the bar is calibrated.
+# While charging, the power bar (green cap on top, white fill growing from the
+# bottom) is searched for next to the character and LMB is released at the top.
+# "auto": like perfect, but a cast whose bar is not found within
+#         timing.cast_hold_ms is released then (a plain timed cast).
+# "perfect": always wait for the bar (up to max_hold_ms).
+# "timed": never look, just hold for timing.cast_hold_ms.
 mode = "{cast_mode}"
-# Screen points at the empty end and at the full end of the power bar
-# (`calibrate --only cast` sets them and the fill colours).
-empty_x = {empty_x}
-empty_y = {empty_y}
-full_x = {full_x}
-full_y = {full_y}
-fill = {cast_fill}
-tolerance = {cast_tolerance}
+# Screen area searched for the power bar (it moves a little with the camera).
+search_x = {search_x}
+search_y = {search_y}
+search_w = {search_w}
+search_h = {search_h}
 # Release once the predicted fill reaches this fraction of the bar.
 release_at = {release_at}
 # Release this much earlier to cover capture + input latency.
@@ -716,12 +717,10 @@ verbose_reel = {verbose_reel}
             edge_guard = f(k.edge_guard),
             coast_ms = f(k.coast_ms),
             cast_mode = ca.mode.as_str(),
-            empty_x = ca.empty_x,
-            empty_y = ca.empty_y,
-            full_x = ca.full_x,
-            full_y = ca.full_y,
-            cast_fill = colors_str(&ca.fill),
-            cast_tolerance = f(ca.tolerance),
+            search_x = ca.search_x,
+            search_y = ca.search_y,
+            search_w = ca.search_w,
+            search_h = ca.search_h,
             release_at = f(ca.release_at),
             lead_ms = f(ca.lead_ms),
             max_hold_ms = ca.max_hold_ms,
@@ -746,6 +745,33 @@ verbose_reel = {verbose_reel}
         );
         s
     }
+}
+
+/// Upgrades configs written by older versions. Returns true if anything changed.
+fn migrate(table: &mut toml::Table) -> bool {
+    let mut changed = false;
+    // The power bar used to be two calibrated points; it is now searched for.
+    if let Some(toml::Value::Table(cast)) = table.get_mut("cast") {
+        for key in [
+            "empty_x",
+            "empty_y",
+            "full_x",
+            "full_y",
+            "fill",
+            "tolerance",
+        ] {
+            changed |= cast.remove(key).is_some();
+        }
+    }
+    // An uncalibrated (all zero) layout now gets the built-in Fisch defaults.
+    if let Some(toml::Value::Table(layout)) = table.get("layout") {
+        let get = |k: &str| layout.get(k).and_then(|v| v.as_integer()).unwrap_or(0);
+        if get("track_right") - get("track_left") < 20 {
+            table.remove("layout");
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Float formatting that always round-trips as a TOML float.
@@ -805,8 +831,7 @@ mod tests {
         cfg.keys.nav_off = NavOff::ReelEnd;
         cfg.keys.nav_refresh_ms = 1500;
         cfg.cast.mode = CastMode::Perfect;
-        cfg.cast.fill = vec![Rgb([0, 200, 80])];
-        cfg.cast.empty_x = 1400;
+        cfg.cast.search_x = 1400;
         let parsed: Config = toml::from_str(&cfg.to_toml()).unwrap();
         assert_eq!(parsed, cfg);
     }
@@ -819,6 +844,22 @@ mod tests {
             Config::default().to_toml(),
             "regenerate config.example.toml"
         );
+    }
+
+    #[test]
+    fn migrates_old_configs() {
+        let mut old = Config::default().to_toml();
+        old = old.replace("search_x = 1300", "empty_x = 1276\nempty_y = 708\nfull_x = 1037\nfull_y = 708\nfill = [\"#0000ff\"]\ntolerance = 45.0\nsearch_x = 1300");
+        old = old
+            .replace("track_left = 764", "track_left = 0")
+            .replace("track_right = 1796", "track_right = 0");
+        let mut table: toml::Table = toml::from_str(&old).unwrap();
+        assert!(migrate(&mut table));
+        let cfg: Config = toml::Value::Table(table).try_into().unwrap();
+        assert_eq!(cfg.layout, LayoutCfg::default());
+        assert_eq!(cfg.cast, CastCfg::default());
+        let mut current: toml::Table = toml::from_str(&Config::default().to_toml()).unwrap();
+        assert!(!migrate(&mut current));
     }
 
     #[test]

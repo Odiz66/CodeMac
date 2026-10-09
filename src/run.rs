@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow};
 use evdev::KeyCode;
 
 use crate::capture::{self, Capturer, Frame, Rect};
-use crate::cast::{CastBar, CastWatch};
+use crate::cast::{CastFinder, CastWatch};
 use crate::config::{CastMode, Config, NavOff};
 use crate::detect::Detector;
 use crate::hypr::Hypr;
@@ -74,7 +74,7 @@ struct Macro {
     cap: Box<dyn Capturer>,
     det: Detector,
     rect: Rect,
-    cast_bar: Option<CastBar>,
+    cast_bar: Option<CastFinder>,
     keys: Keys,
     nav_on: bool,
     pending_key: Option<(KeyCode, Instant)>,
@@ -99,13 +99,7 @@ pub fn run(cfg: Config, start: bool, verbose: bool, dry_run: bool) -> Result<()>
 
     let cast_bar = match cfg.cast.mode {
         CastMode::Timed => None,
-        CastMode::Auto => CastBar::new(&cfg.cast),
-        CastMode::Perfect => Some(CastBar::new(&cfg.cast).ok_or_else(|| {
-            anyhow!(
-                "cast.mode = \"perfect\" but the power bar is not calibrated; \
-                 run `cargo run --release -- calibrate --only cast`"
-            )
-        })?),
+        CastMode::Auto | CastMode::Perfect => Some(CastFinder::new(&cfg.cast)),
     };
 
     let hypr = Hypr::connect(cfg.window.dispatch_style)?;
@@ -156,7 +150,7 @@ pub fn run(cfg: Config, start: bool, verbose: bool, dry_run: bool) -> Result<()>
     let csv = open_csv(&cfg.logging.catches_csv)?;
     let verbose = verbose || cfg.logging.verbose_reel;
     match &cast_bar {
-        Some(b) => log!("Casting: perfect (watching the power bar at {})", b.rect),
+        Some(b) => log!("Casting: perfect (looking for the power bar in {})", b.rect),
         None => log!("Casting: timed ({} ms hold)", cfg.timing.cast_hold_ms),
     }
     let mut m = Macro {
@@ -406,18 +400,33 @@ impl Macro {
     }
 
     /// Holds the button while watching the power bar; returns how it ended.
-    fn charge(&mut self, bar: &CastBar) -> Result<String> {
+    fn charge(&mut self, bar: &CastFinder) -> Result<String> {
         let mut watch = CastWatch::new(&self.cfg.cast);
         let start = Instant::now();
         let max = Duration::from_millis(self.cfg.cast.max_hold_ms);
+        let timed = Duration::from_millis(self.cfg.timing.cast_hold_ms);
+        let mut bottom = None;
+        let mut seen = false;
         loop {
             self.check()?;
             let frame = self.grab_rect(bar.rect)?;
-            let fill = bar.fill(&frame);
+            let reading = bar.read(&frame, bottom);
+            if let Some(r) = reading {
+                bottom = Some(r.bottom);
+                seen = true;
+            }
+            let fill = reading.map_or(0.0, |r| r.fill);
             let t = frame
                 .received
                 .saturating_duration_since(start)
                 .as_secs_f64();
+            if !seen && self.cfg.cast.mode == CastMode::Auto && start.elapsed() >= timed {
+                self.totals.fallback_casts += 1;
+                return Ok(paint(
+                    "power bar not found - timed cast; check `debug --cast`",
+                    "33",
+                ));
+            }
             if watch.update(t, fill) {
                 self.totals.bar_casts += 1;
                 return Ok(format!(

@@ -1,109 +1,125 @@
-//! Perfect casts: watch the power bar while charging and release at the top.
+//! Perfect casts: find the power bar while charging and release at the top.
 //!
-//! The bar is described by two screen points (its empty end and its full end)
-//! and the colours of its fill. The filled fraction is measured along the line
-//! between the points; each sample also looks at its two neighbours across the
-//! line so a 1 px misalignment does not matter.
+//! Fisch draws the power bar next to the character: a thin vertical bar with
+//! a green cap at the top and a white fill growing up from the bottom. It is
+//! attached to the character, so it shifts a little whenever the camera
+//! moves. Instead of fixed coordinates the bar is searched for in an area:
+//! first the green cap, then the white fill in the column below it.
 
 use crate::capture::{Frame, Rect};
 use crate::config::CastCfg;
-use crate::detect::Palette;
 use crate::tracker::Track;
 
-pub struct CastBar {
-    pub rect: Rect,
-    /// Sample points relative to `rect`, from the empty end to the full end.
-    points: Vec<(u32, u32)>,
-    /// Offset to the neighbours across the bar.
-    across: (i32, i32),
-    palette: Palette,
+/// Green cap at the top of the bar.
+fn is_cap(p: [u8; 3]) -> bool {
+    let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+    g >= 90 && g - r >= 30 && g - b >= 25
 }
 
-impl CastBar {
-    /// `None` when the power bar has not been calibrated.
-    pub fn new(cfg: &CastCfg) -> Option<CastBar> {
-        if !cfg.is_calibrated() {
-            return None;
-        }
-        Some(Self::from_points(
-            (cfg.empty_x, cfg.empty_y),
-            (cfg.full_x, cfg.full_y),
-            Palette::new(&cfg.fill, cfg.tolerance),
-        ))
-    }
+/// White fill (bright and colourless, so the cyan rod effects do not count).
+fn is_fill(p: [u8; 3]) -> bool {
+    let mn = p[0].min(p[1]).min(p[2]);
+    let mx = p[0].max(p[1]).max(p[2]);
+    mn >= 170 && mx - mn <= 45
+}
 
-    pub fn from_points(empty: (i32, i32), full: (i32, i32), palette: Palette) -> CastBar {
-        let (dx, dy) = (full.0 - empty.0, full.1 - empty.1);
-        let n = dx.abs().max(dy.abs()).max(1) as usize + 1;
-        let pad = 2;
-        let rect = Rect {
-            x: (empty.0.min(full.0) - pad).max(0),
-            y: (empty.1.min(full.1) - pad).max(0),
-            w: dx.abs() + 2 * pad + 1,
-            h: dy.abs() + 2 * pad + 1,
-        };
-        let points = (0..n)
-            .map(|i| {
-                let f = i as f32 / (n - 1) as f32;
-                let x = empty.0 as f32 + dx as f32 * f;
-                let y = empty.1 as f32 + dy as f32 * f;
-                (
-                    (x.round() as i32 - rect.x) as u32,
-                    (y.round() as i32 - rect.y) as u32,
-                )
-            })
-            .collect();
-        let across = if dx.abs() >= dy.abs() { (0, 1) } else { (1, 0) };
-        CastBar {
-            rect,
-            points,
-            across,
-            palette,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CastReading {
+    /// Filled fraction 0..1.
+    pub fill: f32,
+    /// Cap position (bottom of the cap), relative to the search area.
+    pub cap: (u32, u32),
+    /// Bottom of the bar, relative to the search area.
+    pub bottom: u32,
+}
+
+pub struct CastFinder {
+    pub rect: Rect,
+}
+
+impl CastFinder {
+    pub fn new(cfg: &CastCfg) -> CastFinder {
+        CastFinder {
+            rect: Rect {
+                x: cfg.search_x.max(0),
+                y: cfg.search_y.max(0),
+                w: cfg.search_w.max(16),
+                h: cfg.search_h.max(16),
+            },
         }
     }
 
-    /// Filled fraction of the bar (0..1).
-    pub fn fill(&self, frame: &Frame) -> f32 {
-        let filled = self
-            .points
-            .iter()
-            .filter(|&&p| self.is_filled(frame, p))
-            .count();
-        filled as f32 / self.points.len() as f32
-    }
-
-    fn is_filled(&self, frame: &Frame, (x, y): (u32, u32)) -> bool {
-        let mut hits = 0;
-        for k in [-1, 0, 1] {
-            let px = x as i32 + self.across.0 * k;
-            let py = y as i32 + self.across.1 * k;
-            if px >= 0
-                && py >= 0
-                && (px as u32) < frame.width
-                && (py as u32) < frame.height
-                && self.palette.matches(frame.px(px as u32, py as u32))
-            {
-                hits += 1;
+    /// Finds the bar in a frame of `rect`. `bottom_hint` is the lowest bottom
+    /// seen so far during this charge (the bottom of the bar never moves while
+    /// charging, but a nearly empty fill is hard to see).
+    pub fn read(&self, frame: &Frame, bottom_hint: Option<u32>) -> Option<CastReading> {
+        let mut cap: Vec<(u32, u32)> = Vec::new();
+        for y in 0..frame.height {
+            for x in 0..frame.width {
+                if is_cap(frame.px(x, y)) {
+                    cap.push((x, y));
+                }
             }
         }
-        hits >= 2
-    }
+        if cap.len() < 4 {
+            return None;
+        }
+        let mut xs: Vec<u32> = cap.iter().map(|p| p.0).collect();
+        xs.sort_unstable();
+        let mid = xs[xs.len() / 2];
+        let near: Vec<(u32, u32)> = cap.into_iter().filter(|p| p.0.abs_diff(mid) <= 8).collect();
+        if near.len() < 4 {
+            return None;
+        }
+        let mut near_x: Vec<u32> = near.iter().map(|p| p.0).collect();
+        near_x.sort_unstable();
+        let cap_x = near_x[near_x.len() / 2];
+        let cap_y = near.iter().map(|p| p.1).max().unwrap_or(0);
 
-    /// Sample points in screen coordinates (for drawing).
-    pub fn screen_points(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
-        self.points
-            .iter()
-            .map(|&(x, y)| (x as i32 + self.rect.x, y as i32 + self.rect.y))
-    }
-
-    /// Pixels at the empty end of the bar (first 15 %), used to learn the fill colour.
-    pub fn empty_end_pixels(&self, frame: &Frame) -> Vec<[u8; 3]> {
-        let n = (self.points.len() * 15 / 100).max(3).min(self.points.len());
-        self.points[..n]
-            .iter()
-            .filter(|&&(x, y)| x < frame.width && y < frame.height)
-            .map(|&(x, y)| frame.px(x, y))
-            .collect()
+        // Scan the bar column (and its neighbours) from the bottom of the
+        // search area upwards: the lowest white pixel is the bottom of the
+        // fill, and the white run above it is the fill.
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for x in [cap_x.saturating_sub(1), cap_x, cap_x + 1] {
+            if x >= frame.width {
+                continue;
+            }
+            let Some(bottom) = (cap_y + 1..frame.height)
+                .rev()
+                .find(|&y| is_fill(frame.px(x, y)))
+            else {
+                continue;
+            };
+            let mut top = bottom;
+            while top > cap_y + 1 {
+                let up = top - 1;
+                let gap_ok = up > cap_y + 1 && is_fill(frame.px(x, up - 1));
+                if is_fill(frame.px(x, up)) || gap_ok {
+                    top = up;
+                } else {
+                    break;
+                }
+            }
+            runs.push((bottom, top));
+        }
+        runs.sort_unstable();
+        let (bottom, top) = match runs.get(runs.len() / 2) {
+            Some(&(b, t)) => (b.max(bottom_hint.unwrap_or(0)), t),
+            None => {
+                let b = bottom_hint?;
+                (b, b + 1)
+            }
+        };
+        if bottom <= cap_y + 20 {
+            return None;
+        }
+        let len = (bottom - cap_y) as f32;
+        let fill = ((bottom + 1).saturating_sub(top) as f32 / len).clamp(0.0, 1.0);
+        Some(CastReading {
+            fill,
+            cap: (cap_x, cap_y),
+            bottom,
+        })
     }
 }
 
@@ -168,43 +184,85 @@ impl CastWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Rgb;
 
-    const FILL: [u8; 3] = [60, 220, 90];
-
-    fn bar() -> CastBar {
-        // Vertical bar: empty end at the bottom (y 300), full end at the top (y 200).
-        CastBar::from_points((50, 300), (50, 200), Palette::new(&[Rgb(FILL)], 40.0))
-    }
-
-    fn draw(b: &CastBar, fill: f32) -> Frame {
-        let mut f = Frame::new(b.rect.w as u32, b.rect.h as u32);
-        let n = b.points.len();
-        let filled = (n as f32 * fill).round() as usize;
-        for (i, &(x, y)) in b.points.iter().enumerate() {
-            let c = if i < filled { FILL } else { [30, 30, 30] };
-            for k in -1..=1 {
-                f.set((x as i32 + k) as u32, y, c);
+    /// Night-time background with some noise, a bar with a green cap at
+    /// (cap_x, cap_top..cap_top+6) and a 10 px wide body down to `bottom`,
+    /// filled from the bottom to `fill`.
+    fn scene(cap_x: u32, cap_top: u32, bottom: u32, fill: f32) -> Frame {
+        let mut f = Frame::new(420, 660);
+        for y in 0..f.height {
+            for x in 0..f.width {
+                let n = ((x * 7 + y * 13) % 17) as u8;
+                f.set(x, y, [30 + n, 28 + n, 70 + n * 2]);
+            }
+        }
+        // Some cyan rod sparkle, which must not count as fill.
+        for y in 300..340 {
+            for x in 40..60 {
+                f.set(x, y, [120, 240, 255]);
+            }
+        }
+        for y in cap_top..cap_top + 6 {
+            for x in cap_x - 5..cap_x + 5 {
+                f.set(x, y, [81, 141, 66]);
+            }
+        }
+        let body_top = cap_top + 6;
+        let len = bottom - (cap_top + 5);
+        let fill_top = bottom + 1 - (len as f32 * fill).round() as u32;
+        for y in body_top..=bottom {
+            for x in cap_x - 5..cap_x + 5 {
+                f.set(
+                    x,
+                    y,
+                    if y >= fill_top {
+                        [238, 236, 230]
+                    } else {
+                        [26, 22, 35]
+                    },
+                );
             }
         }
         f
     }
 
     #[test]
-    fn measures_fill_from_the_empty_end() {
-        let b = bar();
-        assert_eq!(
-            b.rect,
-            Rect {
-                x: 48,
-                y: 198,
-                w: 5,
-                h: 105
-            }
-        );
-        for fill in [0.0, 0.25, 0.5, 1.0] {
-            assert!((b.fill(&draw(&b, fill)) - fill).abs() < 0.02);
+    fn reads_the_fill() {
+        let finder = CastFinder::new(&CastCfg::default());
+        for fill in [0.1, 0.25, 0.5, 0.8, 1.0] {
+            let r = finder.read(&scene(200, 100, 400, fill), None).unwrap();
+            assert!((r.fill - fill).abs() < 0.02, "{fill} -> {}", r.fill);
+            assert_eq!(r.bottom, 400);
         }
+    }
+
+    #[test]
+    fn follows_the_bar_when_the_camera_moves() {
+        let finder = CastFinder::new(&CastCfg::default());
+        let r = finder.read(&scene(330, 40, 420, 0.5), None).unwrap();
+        assert!((r.fill - 0.5).abs() < 0.02);
+        assert_eq!(r.cap.0, 330);
+    }
+
+    #[test]
+    fn nothing_without_a_bar() {
+        let finder = CastFinder::new(&CastCfg::default());
+        let mut f = scene(200, 100, 400, 0.5);
+        for y in 90..420 {
+            for x in 190..210 {
+                f.set(x, y, [30, 28, 70]);
+            }
+        }
+        assert_eq!(finder.read(&f, None), None);
+    }
+
+    #[test]
+    fn empty_bar_uses_the_known_bottom() {
+        let finder = CastFinder::new(&CastCfg::default());
+        let f = scene(200, 100, 400, 0.0);
+        assert_eq!(finder.read(&f, None), None);
+        let r = finder.read(&f, Some(400)).unwrap();
+        assert!(r.fill < 0.01);
     }
 
     #[test]

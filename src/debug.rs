@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::capture::{self, Capturer, Frame, Grim, Rect, Screencopy};
-use crate::cast::{CastBar, CastWatch};
+use crate::cast::{CastFinder, CastWatch};
 use crate::config::Config;
 use crate::detect::{Detector, Layout};
 use crate::hypr::Hypr;
@@ -55,7 +55,7 @@ pub fn debug(cfg: Config, args: Args) -> Result<()> {
         return full_screenshot(&cfg, &args.out);
     }
     if args.cast {
-        return watch_cast(&cfg, &flags, args.frames);
+        return watch_cast(&cfg, &flags, args.frames, &args.out);
     }
     let layout = Layout::from_config(&cfg.layout)?;
     let rect = layout.capture;
@@ -349,15 +349,10 @@ fn full_screenshot(cfg: &Config, out: &Path) -> Result<()> {
     } else {
         println!("The reel bar is not calibrated yet; only the cursor park point is drawn.");
     }
-    if let Some(bar) = CastBar::new(&cfg.cast) {
-        for (x, y) in bar.screen_points() {
-            let (x, y) = to_local(x, y);
-            for k in -1..=1 {
-                if x + k >= 0 && y >= 0 {
-                    ann.set((x + k) as u32, y as u32, [255, 128, 0]);
-                }
-            }
-        }
+    {
+        let r = CastFinder::new(&cfg.cast).rect;
+        let (x, y) = to_local(r.x, r.y);
+        outline(&mut ann, x, y, x + r.w - 1, y + r.h - 1, [255, 128, 0]);
     }
     let (cx, cy) = to_local(cfg.window.cursor_x, cfg.window.cursor_y);
     for d in -12..=12 {
@@ -373,53 +368,58 @@ fn full_screenshot(cfg: &Config, out: &Path) -> Result<()> {
     save_png(&ann_path, &ann)?;
     println!("Saved {} and {}", raw_path.display(), ann_path.display());
     println!(
-        "magenta = capture region, yellow = reel track, cyan = progress row, orange = cast power bar, \
+        "magenta = capture region, yellow = reel track, cyan = progress row, orange = power bar search area, \
          green cross = cursor park point"
     );
     Ok(())
 }
 
-/// `debug --cast`: prints the power bar fill while you charge casts by hand.
-fn watch_cast(cfg: &Config, flags: &Flags, frames: u64) -> Result<()> {
-    let bar = CastBar::new(&cfg.cast).ok_or_else(|| {
-        anyhow::anyhow!(
-            "the power bar is not calibrated; run `cargo run --release -- calibrate --only cast`"
-        )
-    })?;
-    let mut cap = capture::open(&cfg.capture, Some(bar.rect))?;
+/// `debug --cast`: prints what the power bar finder sees while you charge casts by hand.
+fn watch_cast(cfg: &Config, flags: &Flags, frames: u64, out: &Path) -> Result<()> {
+    let finder = CastFinder::new(&cfg.cast);
+    let mut cap = capture::open(&cfg.capture, Some(finder.rect))?;
     println!(
-        "Watching the power bar at {}. Charge casts by hand; Ctrl+C to stop.",
-        bar.rect
+        "Looking for the power bar in {}. Charge casts by hand; Ctrl+C to stop.",
+        finder.rect
     );
     println!("\"RELEASE\" marks the frame where the macro would let go.");
-    let mut watch: Option<(CastWatch, Instant, bool)> = None;
+    let mut watch: Option<(CastWatch, Instant, bool, u32)> = None;
     let mut n = 0u64;
+    let mut saved = false;
     while !flags.quitting() && (frames == 0 || n < frames) {
-        let frame = cap.grab(bar.rect)?;
+        let frame = cap.grab(finder.rect)?;
         n += 1;
-        let fill = bar.fill(&frame);
-        if fill > 0.05 && watch.is_none() {
-            watch = Some((CastWatch::new(&cfg.cast), frame.received, false));
-            println!("--- charging ---");
+        let hint = watch.as_ref().map(|w| w.3);
+        let Some(r) = finder.read(&frame, hint) else {
+            if let Some((w, ..)) = watch.take() {
+                println!("--- bar gone (peak {:.0}%) ---", w.peak() * 100.0);
+            }
+            continue;
+        };
+        if watch.is_none() {
+            watch = Some((CastWatch::new(&cfg.cast), frame.received, false, r.bottom));
+            println!(
+                "--- power bar found at {},{} (cap) - {} px tall ---",
+                finder.rect.x + r.cap.0 as i32,
+                finder.rect.y + r.cap.1 as i32,
+                r.bottom - r.cap.1
+            );
+            if !saved {
+                save_png(&out.join("cast_found.png"), &frame)?;
+                saved = true;
+            }
         }
+        let (w, t0, released, bottom) = watch.as_mut().expect("just set");
+        *bottom = (*bottom).max(r.bottom);
+        let t = frame.received.duration_since(*t0).as_secs_f64();
         let mut line = format!(
             "{:6.1}% {}",
-            fill * 100.0,
-            "#".repeat((fill * 40.0).round() as usize)
+            r.fill * 100.0,
+            "#".repeat((r.fill * 40.0).round() as usize)
         );
-        if let Some((w, t0, released)) = watch.as_mut() {
-            let t = frame.received.duration_since(*t0).as_secs_f64();
-            if w.update(t, fill) && !*released {
-                *released = true;
-                line.push_str(&format!("   <-- RELEASE ({} ms)", (t * 1000.0).round()));
-            }
-            if fill < 0.02 {
-                println!("--- bar gone (peak {:.0}%) ---", w.peak() * 100.0);
-                watch = None;
-                continue;
-            }
-        } else {
-            continue;
+        if w.update(t, r.fill) && !*released {
+            *released = true;
+            line.push_str(&format!("   <-- RELEASE ({} ms)", (t * 1000.0).round()));
         }
         println!("{line}");
     }

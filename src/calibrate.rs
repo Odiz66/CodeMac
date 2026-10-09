@@ -21,7 +21,6 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
 use crate::capture::{self, Capturer, Frame};
-use crate::cast::CastBar;
 use crate::config::{ColorsCfg, Config, Rgb};
 use crate::detect::{Detector, Layout, Palette, dist_sq, runs};
 use crate::hypr::Hypr;
@@ -32,24 +31,23 @@ use crate::signals::{self, Flags};
 pub enum Part {
     Region,
     Colors,
-    Cast,
 }
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Seconds before each cursor position is read (F6 reads it immediately).
-    #[arg(long, default_value_t = 5)]
+    /// Old hover-and-F6 wizard instead of the automatic calibration.
+    #[arg(long)]
+    manual: bool,
+    /// --manual: seconds before each cursor position is read (0 = wait for F6).
+    #[arg(long, default_value_t = 0)]
     countdown: u64,
-    /// Only redo one part.
+    /// --manual: only redo one part.
     #[arg(long, value_enum)]
     only: Option<Part>,
-    /// Do not set up progress-bar reading.
+    /// --manual: do not set up progress-bar reading.
     #[arg(long)]
     no_progress: bool,
-    /// Skip the power bar (perfect cast) step.
-    #[arg(long)]
-    no_cast: bool,
-    /// Frames captured for the colour analysis.
+    /// --manual: frames captured for the colour analysis.
     #[arg(long, default_value_t = 90)]
     frames: usize,
     /// Pick colours from a saved PNG (from debug/ or calibration/) instead of live.
@@ -64,9 +62,6 @@ pub struct Args {
     /// With --png: X,Y of a pixel on the filled progress bar (repeatable).
     #[arg(long, value_name = "X,Y", value_parser = parse_point)]
     progress: Vec<(u32, u32)>,
-    /// With --png: X,Y of a pixel on the filled cast power bar (repeatable).
-    #[arg(long, value_name = "X,Y", value_parser = parse_point)]
-    cast_fill: Vec<(u32, u32)>,
     /// With --png: add to the existing colours instead of replacing them.
     #[arg(long)]
     append: bool,
@@ -107,6 +102,15 @@ impl Ctx {
             if self.flags.usr1_count() != start {
                 break;
             }
+            if self.countdown == 0 {
+                if tenths == 0 {
+                    print!("\r  {action}: press F6 when ready ");
+                    let _ = std::io::stdout().flush();
+                    tenths = 1;
+                }
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             if tenths == 0 {
                 break;
             }
@@ -128,15 +132,7 @@ pub fn calibrate(path: &Path, mut cfg: Config, args: Args) -> Result<()> {
     let mut hypr = Hypr::connect(cfg.window.dispatch_style)?;
     let flags = signals::install(false)?;
     let mut cap = capture::open(&cfg.capture, None)?;
-    println!(
-        "Calibration ({} capture). Ctrl+C cancels; F6 skips a countdown.",
-        cap.name()
-    );
-    if args.only != Some(Part::Cast) {
-        println!("Have Fisch open with the Ruinous Oath equipped. Cast manually and get the reel");
-        println!("minigame on screen for each step (you can play it with the mouse button while");
-        println!("hovering - moving the mouse does not affect the minigame).");
-    }
+    println!("Calibration ({} capture). Ctrl+C cancels.", cap.name());
     match hypr.find_client(&cfg.window.class)? {
         Some(c) => {
             println!("Switching to {} in 2 s...", c.class);
@@ -156,6 +152,16 @@ pub fn calibrate(path: &Path, mut cfg: Config, args: Args) -> Result<()> {
         countdown: args.countdown,
     };
 
+    if !args.manual {
+        calibrate_auto(&ctx, cap.as_mut(), &mut cfg)?;
+        cfg.save(path)?;
+        println!("\nSaved to {}.", path.display());
+        println!("Next: `cargo run --release -- run`, switch to the game and press F6.");
+        return Ok(());
+    }
+
+    println!("Hover each spot and press F6 (cast and keep a reel minigame on screen;");
+    println!("you can play it with the mouse button while hovering).");
     let all = args.only.is_none();
     if all || args.only == Some(Part::Region) {
         calibrate_region(&ctx, &mut cfg, &args)?;
@@ -167,16 +173,341 @@ pub fn calibrate(path: &Path, mut cfg: Config, args: Args) -> Result<()> {
         cfg.save(path)?;
         println!("\nSaved colours to {}.", path.display());
     }
-    if (all && !args.no_cast) || args.only == Some(Part::Cast) {
-        calibrate_cast(&ctx, cap.as_mut(), &mut cfg)?;
-        cfg.save(path)?;
-        println!("\nSaved the power bar to {}.", path.display());
-    }
     println!(
         "\nNext: `cargo run --release -- debug` while a minigame is on screen to check detection,"
     );
     println!("then `cargo run --release -- run`.");
     Ok(())
+}
+
+/// Brightness of a pixel (0..255).
+fn luma(p: [u8; 3]) -> u32 {
+    (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000
+}
+
+/// True when the frame shows the reel minigame: the track is mostly dark and
+/// a wide bright block (your bar, white or brown) sits on it.
+pub fn looks_like_minigame(frame: &Frame, layout: &Layout) -> bool {
+    let rows = layout.sample_rows(9, 0.6);
+    let need = (rows.len() * 6).div_ceil(10);
+    let n = layout.track_width() as usize;
+    let mut dark = 0;
+    let mut bright = vec![false; n];
+    for (i, x) in (layout.track_x0..=layout.track_x1).enumerate() {
+        if x >= frame.width {
+            break;
+        }
+        let lum: Vec<u32> = rows
+            .iter()
+            .filter(|&&y| y < frame.height)
+            .map(|&y| luma(frame.px(x, y)))
+            .collect();
+        if lum.iter().filter(|&&l| l < 60).count() >= need {
+            dark += 1;
+        }
+        bright[i] = lum.iter().filter(|&&l| l >= 80).count() >= need;
+    }
+    let wide = runs(&bright, 3).iter().any(|r| {
+        let w = r.end - r.start + 1;
+        w * 100 >= n * 6 && w * 100 <= n * 75
+    });
+    dark * 100 >= n * 30 && wide
+}
+
+/// Automatic calibration: wait for a minigame the user plays by hand, record
+/// it and learn the colours. The positions are the built-in defaults.
+fn calibrate_auto(ctx: &Ctx, cap: &mut dyn Capturer, cfg: &mut Config) -> Result<()> {
+    // Capture a little more around the progress bar so its row can be refined.
+    let wide_cfg = crate::config::LayoutCfg {
+        padding: 16,
+        ..cfg.layout.clone()
+    };
+    let layout = Layout::from_config(&wide_cfg)?;
+    let msg = "Calibration: catch a fish by hand. I record the reel minigame by myself.";
+    println!("\n{msg}");
+    println!("Cast, shake and play the reel minigame normally; let the fish leave your bar");
+    println!("at least once so I also see the bar's other colour. F6 = record right now.");
+    ctx.hypr.notify(msg, 15_000);
+
+    let start_usr1 = ctx.flags.usr1_count();
+    let mut streak = 0;
+    loop {
+        if ctx.flags.quitting() {
+            bail!("calibration cancelled");
+        }
+        let f = cap.grab(layout.capture)?;
+        streak = if looks_like_minigame(&f, &layout) {
+            streak + 1
+        } else {
+            0
+        };
+        if streak >= 4 || ctx.flags.usr1_count() != start_usr1 {
+            break;
+        }
+    }
+    println!("Minigame found - recording 5 s, keep playing...");
+    ctx.hypr
+        .notify("Minigame found - keep playing (recording 5 s)", 5_000);
+    let t = Instant::now();
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut last: Option<Instant> = None;
+    while t.elapsed() < Duration::from_secs(5) {
+        let f = cap.grab(layout.capture)?;
+        if last.is_none_or(|l| f.received.duration_since(l) >= Duration::from_millis(20)) {
+            last = Some(f.received);
+            frames.push(f);
+        }
+    }
+    println!("  recorded {} frames", frames.len());
+
+    let dir = Path::new("calibration");
+    for (i, f) in frames.iter().enumerate().step_by(10) {
+        save_png(&dir.join(format!("frame_{i:03}.png")), f)?;
+    }
+    let a = analyze_auto(&frames, &layout, &cfg.colors, cfg.detection.fish_max_width)?;
+    for note in &a.notes {
+        println!("  note: {note}");
+    }
+    println!("  background: {}", shares(&a.background));
+    println!("  your bar:   {}", shares(&a.bar));
+    println!("  fish:       {}", shares(&a.fish));
+    println!("  progress:   {}", list(&a.progress));
+    cfg.colors.bar = a.bar.iter().map(|(c, _)| *c).collect();
+    cfg.colors.fish = a.fish.iter().map(|(c, _)| *c).collect();
+    cfg.colors.progress = a.progress.clone();
+    cfg.layout.progress_y = match a.progress_row {
+        Some(y) => layout.capture.y + y as i32,
+        None => 0,
+    };
+
+    let mut det = Detector::with_layout(layout.clone(), &cfg.colors, &cfg.detection)?;
+    let (mut bar_hits, mut fish_hits) = (0, 0);
+    for f in &frames {
+        let d = det.detect(f);
+        bar_hits += d.bar.is_some() as usize;
+        fish_hits += (!d.fish.is_empty()) as usize;
+    }
+    let mid = &frames[frames.len() / 2];
+    let d = det.detect(mid);
+    save_png(&dir.join("check.png"), &det.annotate(mid, &d))?;
+    let pct = |h: usize| 100.0 * h as f64 / frames.len() as f64;
+    println!(
+        "  check: your bar found in {:.0}% of frames, fish in {:.0}% (see calibration/check.png)",
+        pct(bar_hits),
+        pct(fish_hits)
+    );
+    if pct(bar_hits) >= 80.0 && pct(fish_hits) >= 80.0 {
+        ctx.hypr
+            .notify("Calibration done! Go back to the terminal.", 6_000);
+    } else {
+        println!("  Detection looks weak. Send this output and calibration/check.png for help,");
+        println!("  or run calibrate again during a longer minigame.");
+        ctx.hypr.notify(
+            "Calibration finished, detection looks weak - see the terminal",
+            8_000,
+        );
+    }
+    Ok(())
+}
+
+pub struct AutoAnalysis {
+    pub background: Vec<(Rgb, f32)>,
+    pub bar: Vec<(Rgb, f32)>,
+    pub fish: Vec<(Rgb, f32)>,
+    pub progress: Vec<Rgb>,
+    /// Refined progress row, relative to the capture.
+    pub progress_row: Option<u32>,
+    pub notes: Vec<String>,
+}
+
+/// Learns the minigame colours from frames of a minigame played by hand.
+/// Unlike `analyze` it needs no cursor position: your bar is the wide bright
+/// block on the dark track, the fish is the thin full-height line.
+pub fn analyze_auto(
+    frames: &[Frame],
+    layout: &Layout,
+    colors: &ColorsCfg,
+    fish_max_width: u32,
+) -> Result<AutoAnalysis> {
+    let mut notes = Vec::new();
+    let rows = layout.sample_rows(9, 0.6);
+    let n = layout.track_width() as usize;
+    let xs = || layout.track_x0..=layout.track_x1;
+
+    // 1. Background: the dark colours of the track.
+    let mut dark = Vec::new();
+    for f in frames.iter().step_by(2) {
+        for x in xs() {
+            for &y in &rows {
+                let p = f.px(x, y);
+                if luma(p) < 70 {
+                    dark.push(p);
+                }
+            }
+        }
+    }
+    let mut background = Vec::new();
+    let mut cum = 0.0;
+    for (c, s) in clusters(&dark, 20.0, 8) {
+        if cum >= 0.9 || background.len() >= 4 {
+            break;
+        }
+        cum += s;
+        background.push((Rgb(c), s));
+    }
+    if background.is_empty() {
+        bail!("the reel track did not look dark - was the minigame on screen?");
+    }
+    let bg = Palette::new(
+        &background.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+        28.0,
+    );
+
+    // 2. Your bar: wide runs of bright columns.
+    let half = rows.len().div_ceil(2);
+    let mut cols = vec![false; n];
+    let mut bar_px = Vec::new();
+    for f in frames {
+        for (i, x) in xs().enumerate() {
+            cols[i] = rows.iter().filter(|&&y| luma(f.px(x, y)) >= 80).count() >= half;
+        }
+        for r in runs(&cols, 3)
+            .into_iter()
+            .filter(|r| (r.end - r.start + 1) * 100 >= n * 5)
+        {
+            for i in r.start..=r.end {
+                for &y in &rows {
+                    let p = f.px(layout.track_x0 + i as u32, y);
+                    if luma(p) >= 80 {
+                        bar_px.push(p);
+                    }
+                }
+            }
+        }
+    }
+    let bar: Vec<(Rgb, f32)> = clusters(&bar_px, 24.0, 6)
+        .into_iter()
+        .filter(|(_, s)| *s >= 0.05)
+        .take(3)
+        .map(|(c, s)| (Rgb(c), s))
+        .collect();
+    if bar.is_empty() {
+        bail!("could not find your bar on the track - was the minigame on screen?");
+    }
+    if bar.len() == 1 {
+        notes.push(
+            "only one bar colour seen; if the bar changes colour when the fish leaves it, \
+             run calibrate again and let the fish leave the bar once"
+                .into(),
+        );
+    }
+    let bar_pal = Palette::new(
+        &bar.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+        colors.bar_tolerance,
+    );
+
+    // 3. Fish: thin runs of columns that are neither background nor bar over
+    //    most of the height.
+    let tall = (rows.len() * 7).div_ceil(10);
+    let max_w = (n * 3 / 100).max(fish_max_width as usize);
+    let mut fish_px = Vec::new();
+    let mut frames_with = 0;
+    for f in frames {
+        for (i, x) in xs().enumerate() {
+            cols[i] = rows
+                .iter()
+                .filter(|&&y| {
+                    let p = f.px(x, y);
+                    !bg.matches(p) && !bar_pal.matches(p)
+                })
+                .count()
+                >= tall;
+        }
+        let mut any = false;
+        for r in runs(&cols, 1)
+            .into_iter()
+            .filter(|r| r.end - r.start < max_w)
+        {
+            any = true;
+            for i in r.start..=r.end {
+                for &y in &rows {
+                    let p = f.px(layout.track_x0 + i as u32, y);
+                    if !bg.matches(p) && !bar_pal.matches(p) {
+                        fish_px.push(p);
+                    }
+                }
+            }
+        }
+        frames_with += any as usize;
+    }
+    let fish_cl = clusters(&fish_px, 22.0, 6);
+    let top = fish_cl.first().map_or(0.0, |c| c.1);
+    let fish: Vec<(Rgb, f32)> = fish_cl
+        .into_iter()
+        .filter(|(_, s)| *s >= top * 0.25)
+        .take(3)
+        .map(|(c, s)| (Rgb(c), s))
+        .collect();
+    if fish.is_empty() {
+        bail!("could not find the fish line on the track");
+    }
+    if frames_with * 2 < frames.len() {
+        notes.push(format!(
+            "the fish was only found in {frames_with} of {} frames",
+            frames.len()
+        ));
+    }
+
+    // 4. Progress bar: the row whose left end is filled (white) while its
+    //    right end is still empty, in most frames. The white outline rows are
+    //    white at both ends and are skipped that way.
+    let mut progress = Vec::new();
+    let mut progress_row = None;
+    if let Some(p) = layout.progress {
+        let width = (p.x1 - p.x0 + 1) as usize;
+        let k = (width / 50).max(4) as u32;
+        let left = p.x0 + 3..p.x0 + 3 + k;
+        let right = p.x1.saturating_sub(3 + k)..p.x1.saturating_sub(3);
+        let y_lo = p.y.saturating_sub(12);
+        let y_hi = (p.y + 12).min(frames[0].height - 1);
+        let mut good: Vec<u32> = Vec::new();
+        for y in y_lo..=y_hi {
+            let hits = frames
+                .iter()
+                .filter(|f| {
+                    let l = left.clone().filter(|&x| luma(f.px(x, y)) >= 170).count();
+                    let r = right.clone().filter(|&x| luma(f.px(x, y)) < 120).count();
+                    l * 10 >= k as usize * 8 && r * 10 >= k as usize * 8
+                })
+                .count();
+            if hits * 2 >= frames.len() {
+                good.push(y);
+            }
+        }
+        if let Some(&y) = good.get(good.len() / 2) {
+            progress_row = Some(y);
+            let px: Vec<[u8; 3]> = frames
+                .iter()
+                .flat_map(|f| left.clone().map(move |x| f.px(x, y)))
+                .collect();
+            progress = clusters(&px, 20.0, 2)
+                .into_iter()
+                .filter(|(_, s)| *s >= 0.3)
+                .map(|(c, _)| Rgb(c))
+                .collect();
+        } else {
+            notes.push("progress bar not found; progress reading is switched off".into());
+        }
+    }
+
+    Ok(AutoAnalysis {
+        background,
+        bar,
+        fish,
+        progress,
+        progress_row,
+        notes,
+    })
 }
 
 fn calibrate_region(ctx: &Ctx, cfg: &mut Config, args: &Args) -> Result<()> {
@@ -329,90 +660,6 @@ fn calibrate_colors(
         "  frames saved to {}/ (frame_000_ann.png shows what was detected)",
         dir.display()
     );
-    Ok(())
-}
-
-fn calibrate_cast(ctx: &Ctx, cap: &mut dyn Capturer, cfg: &mut Config) -> Result<()> {
-    println!("\n== Power bar (perfect cast) ==");
-    println!("For the next two steps hold the mouse button to charge a cast while you hover");
-    println!("(release and charge again whenever you need to).");
-    let empty = ctx.point("Hover the EMPTY end of the power bar - where the fill starts.")?;
-    let full =
-        ctx.point("Hover the FULL end of the power bar - where the fill ends when it is full.")?;
-    let len = (full.0 - empty.0).abs().max((full.1 - empty.1).abs());
-    if len < 10 {
-        bail!("the two ends are only {len} px apart; hover both ends of the power bar");
-    }
-    let probe = CastBar::from_points(empty, full, Palette::new(&[], 0.0));
-    ctx.countdown(
-        "Let go of the mouse button. When the countdown ends, press and HOLD it to charge a \
-         cast and keep holding for 3 seconds - I record the bar while it fills.",
-        "recording starts",
-    )?;
-    let start = Instant::now();
-    let mut frames = Vec::new();
-    while start.elapsed() < Duration::from_millis(3000) {
-        frames.push(cap.grab(probe.rect)?);
-    }
-    println!(
-        "\r  captured {} frames of the power bar                    ",
-        frames.len()
-    );
-
-    // By the second half of the recording the empty end has been filled for a
-    // while, so its dominant colours are the fill.
-    let px: Vec<[u8; 3]> = frames[frames.len() / 2..]
-        .iter()
-        .flat_map(|f| probe.empty_end_pixels(f))
-        .collect();
-    let fill: Vec<Rgb> = clusters(&px, 18.0, 4)
-        .into_iter()
-        .filter(|(_, s)| *s >= 0.2)
-        .take(3)
-        .map(|(c, _)| Rgb(c))
-        .collect();
-    if fill.is_empty() {
-        bail!("could not find a fill colour at the empty end of the bar");
-    }
-    let bar = CastBar::from_points(empty, full, Palette::new(&fill, cfg.cast.tolerance));
-    let fills: Vec<f32> = frames.iter().map(|f| bar.fill(f)).collect();
-    let peak = fills.iter().cloned().fold(0.0, f32::max);
-    let first_full = fills.iter().position(|&f| f >= 0.95);
-    println!("  fill colour(s): {}", list(&fill));
-    let step = (fills.len() / 15).max(1);
-    let timeline: Vec<String> = fills
-        .iter()
-        .step_by(step)
-        .map(|f| format!("{:.0}%", f * 100.0))
-        .collect();
-    println!("  fill over time: {}", timeline.join(" "));
-    match first_full {
-        Some(i) => println!("  full after {:.2} s", i as f64 * 3.0 / fills.len() as f64),
-        None => {
-            println!(
-                "  WARNING: the bar never looked more than {:.0}% full.",
-                peak * 100.0
-            );
-            println!("  If the top is drawn in another colour, add it by hand:");
-            println!("  calibrate --png calibration/cast_NNN.png --cast-fill X,Y --append");
-        }
-    }
-    if let Some(i) = first_full
-        && fills[i..].iter().any(|&f| f < 0.7)
-    {
-        println!("  The bar goes back down after filling; the macro releases on the way up.");
-    }
-
-    let dir = Path::new("calibration");
-    for (i, f) in frames.iter().enumerate().step_by(4) {
-        save_png(&dir.join(format!("cast_{i:03}.png")), f)?;
-    }
-    println!("  frames saved to {}/cast_*.png", dir.display());
-
-    let c = &mut cfg.cast;
-    (c.empty_x, c.empty_y) = empty;
-    (c.full_x, c.full_y) = full;
-    c.fill = fill;
     Ok(())
 }
 
@@ -673,14 +920,8 @@ fn median3x3(img: &Frame, x: u32, y: u32) -> Result<Rgb> {
 }
 
 fn pick_from_png(path: &Path, mut cfg: Config, args: &Args, png: &Path) -> Result<()> {
-    if args.bar.is_empty()
-        && args.fish.is_empty()
-        && args.progress.is_empty()
-        && args.cast_fill.is_empty()
-    {
-        bail!(
-            "--png needs at least one of --bar X,Y / --fish X,Y / --progress X,Y / --cast-fill X,Y"
-        );
+    if args.bar.is_empty() && args.fish.is_empty() && args.progress.is_empty() {
+        bail!("--png needs at least one of --bar X,Y / --fish X,Y / --progress X,Y");
     }
     let img = load_png(png).with_context(|| format!("loading {}", png.display()))?;
     let apply = |target: &mut Vec<Rgb>, points: &[(u32, u32)], name: &str| -> Result<()> {
@@ -708,7 +949,6 @@ fn pick_from_png(path: &Path, mut cfg: Config, args: &Args, png: &Path) -> Resul
     apply(&mut cfg.colors.bar, &args.bar, "bar")?;
     apply(&mut cfg.colors.fish, &args.fish, "fish")?;
     apply(&mut cfg.colors.progress, &args.progress, "progress")?;
-    apply(&mut cfg.cast.fill, &args.cast_fill, "cast fill")?;
     cfg.save(path)?;
     println!("Saved to {}.", path.display());
     Ok(())
@@ -760,5 +1000,144 @@ mod tests {
             .map(|_| render(&layout, Some((0, 24)), Some((100, 106)), 0.4))
             .collect();
         assert!(analyze(&frames, &layout, layout.track_x0 + 150, &cfg.colors, 70).is_err());
+    }
+
+    /// A frame that looks like Fisch's reel UI in the user's screenshots.
+    fn fisch_frame(layout: &Layout, bar: (u32, u32), fish: u32, progress: f32, seed: u32) -> Frame {
+        let mut f = Frame::new(layout.capture.w as u32, layout.capture.h as u32);
+        // Scene behind the UI: speckled rock.
+        for y in 0..f.height {
+            for x in 0..f.width {
+                let n = (x
+                    .wrapping_mul(2654435761)
+                    .wrapping_add(y * 40503 + seed * 7))
+                    >> 24;
+                let v = if n % 3 == 0 { 200 } else { 60 } as u8;
+                f.set(x, y, [v, v, v.saturating_add(30)]);
+            }
+        }
+        let inside = fish >= bar.0 && fish <= bar.1;
+        for y in layout.track_y0..=layout.track_y1 {
+            for i in 0..layout.track_width() as u32 {
+                let x = layout.track_x0 + i;
+                let n = ((i * 31 + y * 17 + seed) % 9) as u8;
+                let mut c = [16 + n, 16 + n, 18 + n];
+                if i >= bar.0 && i <= bar.1 {
+                    c = if inside {
+                        [239, 239, 239]
+                    } else {
+                        [138, 90, 58]
+                    };
+                    // Arrow strokes: a horizontal shaft one row high.
+                    let mid = (layout.track_y0 + layout.track_y1) / 2;
+                    if y == mid && (i - bar.0) % 100 < 30 {
+                        c = [70, 70, 70];
+                    }
+                }
+                f.set(x, y, c);
+            }
+            for x in fish - 2..=fish + 2 {
+                f.set(layout.track_x0 + x, y, [120, 120, 125]);
+            }
+        }
+        if let Some(p) = layout.progress {
+            let split = p.x0 + ((p.x1 - p.x0) as f32 * progress) as u32;
+            for x in p.x0..=p.x1 {
+                f.set(x, p.y - 4, [245, 245, 245]);
+                f.set(x, p.y + 4, [245, 245, 245]);
+                for y in p.y - 3..=p.y + 3 {
+                    f.set(
+                        x,
+                        y,
+                        if x <= split {
+                            [245, 245, 245]
+                        } else {
+                            [20, 20, 20]
+                        },
+                    );
+                }
+            }
+        }
+        f
+    }
+
+    fn fisch_layout() -> Layout {
+        let cfg = crate::config::LayoutCfg {
+            padding: 16,
+            ..Default::default()
+        };
+        Layout::from_config(&cfg).unwrap()
+    }
+
+    #[test]
+    fn auto_calibration_learns_fisch_colours() {
+        let layout = fisch_layout();
+        let n = layout.track_width() as u32;
+        let frames: Vec<Frame> = (0..60)
+            .map(|i| {
+                let bar_left = 100 + i * 6;
+                // The fish leaves the bar for the last third of the frames.
+                let fish = if i < 40 {
+                    bar_left + 150
+                } else {
+                    (bar_left + 500).min(n - 10)
+                };
+                fisch_frame(
+                    &layout,
+                    (bar_left, bar_left + 390),
+                    fish,
+                    0.2 + i as f32 * 0.005,
+                    i,
+                )
+            })
+            .collect();
+        assert!(looks_like_minigame(&frames[0], &layout));
+        let cfg = Config::default();
+        let a = analyze_auto(&frames, &layout, &cfg.colors, cfg.detection.fish_max_width).unwrap();
+        let has = |v: &[(Rgb, f32)], c: [u8; 3]| {
+            v.iter()
+                .any(|(x, _)| dist_sq(x.0, [c[0] as i32, c[1] as i32, c[2] as i32]) < 200)
+        };
+        assert!(has(&a.bar, [239, 239, 239]), "{:?}", a.bar);
+        assert!(has(&a.bar, [138, 90, 58]), "{:?}", a.bar);
+        assert!(has(&a.fish, [120, 120, 125]), "{:?}", a.fish);
+        let p = layout.progress.unwrap();
+        let row = a.progress_row.unwrap();
+        assert!(row.abs_diff(p.y) <= 3, "progress row {row} vs {}", p.y);
+        assert_eq!(a.progress.len(), 1);
+
+        // The learned colours detect bar and fish in every frame.
+        let mut colors = cfg.colors.clone();
+        colors.bar = a.bar.iter().map(|(c, _)| *c).collect();
+        colors.fish = a.fish.iter().map(|(c, _)| *c).collect();
+        colors.progress = a.progress.clone();
+        let mut det = Detector::with_layout(layout.clone(), &colors, &cfg.detection).unwrap();
+        for (i, f) in frames.iter().enumerate() {
+            let d = det.detect(f);
+            let bar = d.bar.expect("bar");
+            assert!(
+                (bar.left - (100.0 + i as f32 * 6.0)).abs() <= 1.0,
+                "frame {i}: {bar:?}"
+            );
+            assert_eq!(d.fish.len(), 1, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn no_minigame_in_the_plain_scene() {
+        let layout = fisch_layout();
+        let mut f = fisch_frame(&layout, (100, 490), 200, 0.3, 1);
+        // Wipe the UI: rock everywhere.
+        let rock = fisch_frame(&layout, (0, 0), 2, 0.0, 3);
+        for y in layout.track_y0 - 10..=layout.track_y1 + 10 {
+            for x in 0..f.width {
+                let n = (x.wrapping_mul(2654435761).wrapping_add(y * 40503)) >> 24;
+                let v = if n % 3 == 0 { 200 } else { 60 } as u8;
+                f.set(x, y, [v, v, v.saturating_add(30)]);
+            }
+        }
+        assert!(!looks_like_minigame(&f, &layout));
+        let dark = Frame::new(rock.width, rock.height);
+        assert!(!looks_like_minigame(&dark, &layout));
     }
 }

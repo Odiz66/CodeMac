@@ -117,49 +117,39 @@ The prediction scales with the measured capture rate by itself
 
 ## 2. Calibration
 
+The positions of the reel bar, progress bar and power bar are built in for
+Fisch on a 2560x1440 screen, so calibration only has to learn the colours of
+the Ruinous Oath minigame:
+
 ```fish
 cargo run --release -- calibrate
 ```
 
-Each step counts down (5 s, `--countdown N`). **F6 reads the position
-immediately**, which is easier than racing a countdown. You can play the
-minigame with the mouse button while hovering, because moving the mouse does
-not affect it.
+It switches to the game and shows a message there. Then **just catch a fish by
+hand**: cast, shake and play the reel minigame normally, and let the fish leave
+your bar once (the bar turns brown then, and that colour is needed too). As
+soon as the minigame shows up it records 5 seconds by itself, learns the
+colours of your bar, the fish and the progress fill, and saves them to
+`config.toml`. "Calibration done!" appears in the game when it worked; the
+terminal shows how often bar and fish were found, and
+`calibration/check.png` shows what was detected (green lines at the bar
+edges, red at the fish, yellow track outline).
 
-1. Hover the **top-left corner** of the reel track (the long bar your bar slides in).
-2. Hover its **bottom-right corner**.
-3. Hover the **left end** of the progress bar under it.
-4. Hover its **right end**.
-5. Colours: start a Ruinous Oath minigame, **don't click** (your bar rests at
-   the left end), hover **your bar** and wait. About 1.5 s of frames is
-   recorded. The bar colour is taken under the cursor, the background is the
-   dominant track colour, and the fish is the most common narrow full-height
-   object that is neither. The progress colour comes from the left end of the
-   progress bar.
-6. Power bar (perfect cast): while charging a cast, hover the **empty end** of
-   the power bar, then its **full end**.
-7. Let go; when the countdown ends, **press and hold** to charge a cast for
-   3 s. The fill colour is learned from that recording, and the fill over time
-   is printed so you can see whether it reached 100%.
+The power bar needs no calibration: while charging, the macro looks for its
+green cap and white fill next to your character (`[cast]` search area).
 
-Everything is written to `config.toml`, and the frames go to `calibration/`.
-`calibration/frame_000_ann.png` shows what was detected: green lines at the
-bar edges, red at the fish, yellow track outline.
-
-Redo a part with `--only region` / `--only colors` / `--only cast`, skip
-progress with `--no-progress` or the power bar with `--no-cast`. Without a
-calibrated power bar the macro falls back to holding for `timing.cast_hold_ms`.
+Other screen sizes or UI scales: `calibrate --manual` asks you to hover the
+reel bar corners and press F6 for each.
 
 **Manual colour picking** (e.g. the fish was missed): open a saved PNG in an
 image viewer, note pixel coordinates, then run:
 
 ```fish
-cargo run --release -- calibrate --png calibration/frame_012.png --fish 512,20 --fish 530,22 --append
+cargo run --release -- calibrate --png calibration/frame_010.png --fish 512,20 --fish 530,22 --append
 ```
 
-`--bar X,Y`, `--progress X,Y` and `--cast-fill X,Y` (on a
-`calibration/cast_*.png`) work the same way. Without `--append` the list is
-replaced.
+`--bar X,Y` and `--progress X,Y` work the same way. Without `--append` the
+list is replaced.
 
 ## 3. Check detection
 
@@ -170,11 +160,11 @@ cargo run --release -- debug --full     # full screenshot with regions drawn on 
 cargo run --release -- debug --cast     # power bar fill while you charge casts by hand
 ```
 
-`debug --cast` prints the fill every frame and marks `<-- RELEASE` where the
-macro would let go. Charge a few casts by hand: if the game shows a perfect
-cast when you release at that moment, the timing is right. Otherwise adjust
-`cast.release_at` (where to release) or `cast.lead_ms` (how early, to cover
-latency).
+`debug --cast` shows where it found the power bar, prints the fill every
+frame and marks `<-- RELEASE` where the macro would let go. Charge a few casts
+by hand: if the game shows a perfect cast when you release at that moment, the
+timing is right. Otherwise adjust `cast.release_at` (where to release) or
+`cast.lead_ms` (how early, to cover latency).
 
 `debug` prints a line per frame (interval, FPS, bar, fish, inside/outside +
 margin, progress) and saves raw + annotated PNGs to `debug/` every 30 frames.
@@ -276,7 +266,7 @@ test sim`). Fisch's real physics may differ, so tune on the real game.
 | Enter presses the wrong button (rod unequipped, menus) | Raise `timing.after_cast_ms` so navigation starts after the shake button exists. `keys.reequip` (rod slot, default `KEY_1`) recovers after timeouts. |
 | Only the first shake button gets pressed | Set `keys.nav_refresh_ms = 1500`: UI navigation is switched off and on every 1.5 s so the newest button is selected. |
 | Cast released too early / too late | Check with `debug --cast`, then adjust `cast.release_at` / `cast.lead_ms`. |
-| "power bar not seen" in the cast log | Recalibrate with `calibrate --only cast`; `debug --full` shows where it looks (orange line). |
+| "power bar not found" in the cast log | Check with `debug --cast`; `debug --full` draws the search area (orange box) - move or enlarge `cast.search_*` so the bar is inside it. |
 | Timed casts (no power bar) too weak or too strong | `timing.cast_hold_ms`. |
 | Recasts while the catch popup is still shown | Raise `timing.after_catch_ms`. |
 | Wrong screen coordinates | `debug --full` draws the configured regions on a screenshot. |
@@ -287,7 +277,7 @@ test sim`). Fisch's real physics may differ, so tune on the real game.
 src/main.rs           CLI (run / calibrate / debug)
 src/run.rs            fishing loop: focus, cast, shake, reel, recover, stats
 src/reel.rs           per-minigame logic: tracking, gating, end detection, perfect stats
-src/cast.rs           power bar reading + release timing for perfect casts
+src/cast.rs           power bar finder + release timing for perfect casts
 src/controller.rs     PD + sigma-delta hold/release
 src/tracker.rs        least-squares motion estimation
 src/detect.rs         bar/fish/progress detection

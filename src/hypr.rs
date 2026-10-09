@@ -120,6 +120,12 @@ impl Hypr {
             .to_string())
     }
 
+    /// Shows a message on top of everything (including the fullscreen game)
+    /// with `hyprctl notify`. Best effort: errors are ignored.
+    pub fn notify(&self, text: &str, ms: u32) {
+        let _ = hyprctl(&["notify", "1", &ms.to_string(), "rgb(33ccff)", text]);
+    }
+
     pub fn cursor_pos(&self) -> Result<(i32, i32)> {
         let s = hyprctl(&["cursorpos"])?;
         parse_cursorpos(&s).ok_or_else(|| anyhow!("unexpected `hyprctl cursorpos` output: {s:?}"))
