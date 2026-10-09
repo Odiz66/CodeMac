@@ -1,0 +1,17 @@
+[package]
+name = "fishmacro"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Wayland/Hyprland fishing-reel macro using uinput and grim"
+license = "MIT"
+
+[dependencies]
+# Virtual input device through /dev/uinput.
+evdev = "0.13"
+# Signal handlers (Ctrl+C, SIGTERM, toggle/kill-switch signals).
+libc = "0.2"
+
+[profile.release]
+# Keep unwinding (the default) so held buttons are released by Drop even on a panic.
+panic = "unwind"

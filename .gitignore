@@ -1,0 +1,7 @@
+/target
+
+# calibration screenshots
+fishmacro-*.png
+
+# RustRover / JetBrains
+.idea/

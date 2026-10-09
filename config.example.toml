@@ -1,0 +1,116 @@
+# fishmacro config. Copy to ~/.config/fishmacro/config.toml (or run `fishmacro init`).
+#
+# Workflow:
+#   1. Pick the reeling style below (mode).
+#   2. Bring up the reeling minigame, run `slurp`, drag a box tightly around the
+#      bar, and copy the "x,y wxh" it prints into [region].
+#   3. Run `fishmacro calibrate` while the minigame is on screen. It saves
+#      fishmacro-region.png / fishmacro-context.png and lists the region's most
+#      common colors; copy the right ones into [detect] and [track].
+#   4. Run `fishmacro watch` and play: it prints what it sees without clicking.
+#   5. Run `fishmacro` and use the toggle key.
+
+[general]
+# How reeling works in your game:
+#   "hold"  - hold the button until the fish is caught
+#   "spam"  - click the button rapidly
+#   "track" - keep a moving marker inside your bar/zone by holding and releasing
+mode = "track"
+
+# evdev name of the button/key to use: BTN_LEFT, BTN_RIGHT, BTN_MIDDLE,
+# KEY_SPACE, KEY_E, ... (keys are physical US-layout positions).
+button = "BTN_LEFT"
+
+# Wait after creating the virtual device so the compositor picks it up.
+device_settle_ms = 300
+
+# The minigame must show up in the region this soon after the toggle key,
+# otherwise reeling stops ("minigame never appeared").
+start_timeout_ms = 3000
+
+# Once seen, the catch counts as done when the minigame has been gone this
+# long (covers flicker and frames where the bar is briefly hidden).
+end_grace_ms = 700
+
+# Hard limit for one reeling session.
+max_reel_ms = 60000
+
+# The macro only presses while the minigame is visible in the region, so it
+# never clicks after the catch (which would cast again in many games).
+# hold/spam only: set true if your game's reeling UI appears only AFTER you
+# start holding/clicking; then it presses right after the toggle key.
+press_before_visible = false
+
+[region]
+# Screen rectangle to watch, in Hyprland layout pixels (same numbers `slurp`
+# prints as "x,y wxh"). Keep it small: just the reeling bar.
+x = 1080
+y = 1150
+width = 400
+height = 30
+
+[detect]
+# Minimum time between captures; 0 = as fast as grim can go (usually 30-60/s).
+capture_interval_ms = 0
+
+# A color that is in the region ONLY while the minigame is up (bar frame,
+# bar background, ...). Required for hold/spam. In track mode you can leave
+# it "" and the marker/zone colors are used instead.
+active_color = ""
+# Max difference per RGB channel (0-255) for a pixel to count as a match.
+active_tolerance = 30
+# How many matching pixels mean "present".
+active_min_pixels = 20
+
+# Optional: a color that appears when the catch succeeded (a "Caught!" banner
+# inside the region). Reeling stops as soon as it is seen. "" = not used.
+done_color = ""
+done_tolerance = 30
+done_min_pixels = 20
+
+[spam]
+# Only for mode = "spam".
+clicks_per_second = 12
+# How long each click holds the button down.
+press_ms = 25
+
+[track]
+# Only for mode = "track".
+# "horizontal": holding moves your zone right. "vertical": holding moves it up.
+axis = "horizontal"
+# true if holding moves the zone the other way (left / down).
+invert = false
+
+# The thing you must follow (fish icon / marker line).
+marker_color = "#ff3b3b"
+marker_tolerance = 30
+marker_min_pixels = 4
+
+# Your controllable zone/bar.
+zone_color = "#5ad25a"
+zone_tolerance = 30
+zone_min_pixels = 10
+
+# Fraction of the bar length around the marker where the macro only brakes
+# the zone instead of pushing it. Raise it if the zone jitters.
+deadband = 0.03
+# How far ahead (ms) to predict the marker. Raise it if the zone lags behind
+# a fast marker, lower it if it overshoots.
+lookahead_ms = 80
+
+[cursor]
+# Warp the cursor to (x, y) with hyprctl before reeling, for games that need
+# the pointer over a specific spot. Leave disabled for games that lock the
+# mouse (most 3D games).
+enabled = false
+x = 1280
+y = 720
+
+[hyprland]
+# "lua" for hyprland.lua (Hyprland 0.55+), "legacy" for hyprland.conf.
+# Decides the `hyprctl dispatch` syntax used for the cursor move.
+config_format = "lua"
+
+[calibrate]
+# Pixels of surroundings included in fishmacro-context.png.
+context_margin = 150

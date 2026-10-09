@@ -1,0 +1,5 @@
+# Install to /etc/udev/rules.d/60-fishmacro-uinput.rules
+# Lets members of the `uinput` group create virtual input devices (fishmacro)
+# without root. static_node applies the permissions to /dev/uinput even before
+# the module is loaded.
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="uinput", MODE="0660", OPTIONS+="static_node=uinput"
