@@ -13,6 +13,8 @@ use crate::vision::{Analysis, Detector};
 
 /// Upper bound on how long the loop sleeps, so hotkeys are handled promptly.
 const POLL: Duration = Duration::from_millis(5);
+/// No frame at all for this long means screen capture has stalled.
+const STALL_LIMIT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -72,6 +74,8 @@ fn run(cfg: &Config, input: &mut VirtualInput, capture: &CaptureThread) -> Resul
     let start = Instant::now();
     let mut first_seen: Option<Instant> = None;
     let mut last_visible = start;
+    // Capture time of the newest frame.
+    let mut last_sample = start;
     // Minigame present in the newest frame.
     let mut visible = false;
     let mut tracker = Tracker::new(cfg.track.deadband, cfg.track.lookahead);
@@ -118,6 +122,7 @@ fn run(cfg: &Config, input: &mut VirtualInput, capture: &CaptureThread) -> Resul
 
         for sample in samples {
             let Sample { at, analysis, .. } = sample?;
+            last_sample = at;
             if analysis.catch_done {
                 return Ok(Outcome::DoneColorSeen);
             }
@@ -134,9 +139,17 @@ fn run(cfg: &Config, input: &mut VirtualInput, capture: &CaptureThread) -> Resul
         }
 
         let now = Instant::now();
+        if now.saturating_duration_since(last_sample) > STALL_LIMIT {
+            // Without frames we can't tell whether the minigame is still up.
+            return Err(format!("screen capture stalled (no frame for {} ms)", STALL_LIMIT.as_millis()));
+        }
         match first_seen {
             None if now - start > cfg.start_timeout => return Ok(Outcome::NeverStarted),
-            Some(_) if now.saturating_duration_since(last_visible) > cfg.end_grace => return Ok(Outcome::Caught),
+            // Judged by frame timestamps: frames must have shown the minigame
+            // gone for end_grace, not merely no frames arriving.
+            Some(_) if last_sample.saturating_duration_since(last_visible) > cfg.end_grace => {
+                return Ok(Outcome::Caught);
+            }
             _ => {}
         }
         if now - start > cfg.max_reel {

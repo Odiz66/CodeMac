@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{CaptureBackend, Region};
 use crate::screencopy::Screencopy;
+use crate::signals;
 use crate::vision::{Analysis, Detector};
 
 /// An RGB image, row-major, 3 bytes per pixel.
@@ -47,19 +48,27 @@ impl Capturer {
         Capturer { backend, native: None }
     }
 
-    pub fn grab(&mut self, region: &Region) -> Result<Frame, String> {
+    /// Captures `region` once. `cancel` is polled while waiting for the
+    /// compositor; returning true aborts the capture.
+    pub fn grab(&mut self, region: &Region, cancel: &dyn Fn() -> bool) -> Result<Frame, String> {
         if self.backend == CaptureBackend::Grim {
             return grim_grab(region);
         }
         if self.native.is_none() {
             self.native = Some(Screencopy::connect()?);
         }
-        let result = self.native.as_mut().expect("connected above").grab(region);
+        let result = self.native.as_mut().expect("connected above").grab(region, cancel);
         if result.is_err() {
             // The connection may be unusable now; reconnect on the next grab.
             self.native = None;
         }
         result
+    }
+
+    /// Layout rectangle of the monitor containing `region`, when known
+    /// (built-in backend after a successful grab).
+    pub fn monitor_rect(&self, region: &Region) -> Option<(i32, i32, i32, i32)> {
+        self.native.as_ref().and_then(|sc| sc.monitor_rect(region))
     }
 
     /// Minimum time between captures the backend needs.
@@ -80,9 +89,9 @@ impl Capturer {
 /// Captures `region` twice (setup, then steady state) and reports the
 /// backend and the time per capture.
 pub fn probe(capturer: &mut Capturer, region: &Region) -> Result<String, String> {
-    capturer.grab(region)?;
+    capturer.grab(region, &signals::should_exit)?;
     let started = Instant::now();
-    capturer.grab(region)?;
+    capturer.grab(region, &signals::should_exit)?;
     Ok(format!("{}, {:.1} ms per capture", capturer.describe(), started.elapsed().as_secs_f32() * 1000.0))
 }
 
@@ -182,7 +191,7 @@ impl CaptureThread {
             let mut failures = 0;
             while !stop_flag.load(Ordering::SeqCst) {
                 let started = Instant::now();
-                let message = match capturer.grab(&region) {
+                let message = match capturer.grab(&region, &|| stop_flag.load(Ordering::SeqCst)) {
                     Ok(frame) => {
                         failures = 0;
                         let at = Instant::now();

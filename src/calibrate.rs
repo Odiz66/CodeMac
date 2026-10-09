@@ -20,34 +20,11 @@ const OUTLINE: [u8; 3] = [255, 0, 255];
 pub fn calibrate(cfg: &Config, out_dir: &Path) -> Result<(), String> {
     let region = cfg.region;
     let mut capturer = Capturer::new(cfg.capture_backend);
-    let frame = capturer.grab(&region)?;
-
-    // Context: the region plus a margin around it, with the region outlined.
-    let m = cfg.calibrate_margin as i32;
-    let cx = (region.x - m).max(0);
-    let cy = (region.y - m).max(0);
-    let context = Region {
-        x: cx,
-        y: cy,
-        width: (region.x + region.width as i32 + m - cx) as u32,
-        height: (region.y + region.height as i32 + m - cy) as u32,
-    };
-    let mut context_frame = capturer.grab(&context)?;
-    let scale = context_frame.width as f32 / context.width as f32;
-    outline(
-        &mut context_frame,
-        ((region.x - cx) as f32 * scale).round() as isize,
-        ((region.y - cy) as f32 * scale).round() as isize,
-        (region.width as f32 * scale).round() as isize,
-        (region.height as f32 * scale).round() as isize,
-    );
+    let frame = capturer.grab(&region, &signals::should_exit)?;
 
     let region_path = out_dir.join(REGION_FILE);
-    let context_path = out_dir.join(CONTEXT_FILE);
     let zoom = (1200 / frame.width.max(frame.height)).clamp(1, 8);
-    let zoomed = upscale(&frame, zoom);
-    save(&region_path, &zoomed)?;
-    save(&context_path, &context_frame)?;
+    save(&region_path, &upscale(&frame, zoom))?;
 
     println!(
         "Region {} (layout px) -> captured {}x{} px with {}",
@@ -62,7 +39,26 @@ pub fn calibrate(cfg: &Config, out_dir: &Path) -> Result<(), String> {
     println!();
     println!("Saved:");
     println!("  {}  (the region, zoomed {zoom}x)", region_path.display());
-    println!("  {}  (region outlined in magenta with {m} px around it)", context_path.display());
+
+    // Context: the region plus a margin around it (kept on the same monitor),
+    // with the region outlined. Optional: a failure here only skips the image.
+    let context = context_box(region, cfg.calibrate_margin as i32, capturer.monitor_rect(&region));
+    match capturer.grab(&context, &signals::should_exit) {
+        Ok(mut context_frame) => {
+            let scale = context_frame.width as f32 / context.width as f32;
+            outline(
+                &mut context_frame,
+                ((region.x - context.x) as f32 * scale).round() as isize,
+                ((region.y - context.y) as f32 * scale).round() as isize,
+                (region.width as f32 * scale).round() as isize,
+                (region.height as f32 * scale).round() as isize,
+            );
+            let context_path = out_dir.join(CONTEXT_FILE);
+            save(&context_path, &context_frame)?;
+            println!("  {}  (region outlined in magenta, with its surroundings)", context_path.display());
+        }
+        Err(e) => println!("  (no context screenshot: {e})"),
+    }
     println!();
 
     let total = frame.width * frame.height;
@@ -75,6 +71,17 @@ pub fn calibrate(cfg: &Config, out_dir: &Path) -> Result<(), String> {
     let analysis = Detector::from_config(cfg).analyze(&frame);
     print_report(cfg, &analysis);
     Ok(())
+}
+
+/// `region` grown by `margin` on every side, clipped to `monitor` (x, y, w, h)
+/// when known, otherwise to non-negative coordinates.
+fn context_box(region: Region, margin: i32, monitor: Option<(i32, i32, i32, i32)>) -> Region {
+    let (mx, my, mw, mh) = monitor.unwrap_or((0, 0, i32::MAX, i32::MAX));
+    let x0 = (region.x - margin).max(mx);
+    let y0 = (region.y - margin).max(my);
+    let x1 = (region.x + region.width as i32 + margin).min(mx.saturating_add(mw));
+    let y1 = (region.y + region.height as i32 + margin).min(my.saturating_add(mh));
+    Region { x: x0, y: y0, width: (x1 - x0).max(1) as u32, height: (y1 - y0).max(1) as u32 }
 }
 
 fn print_report(cfg: &Config, a: &Analysis) {
@@ -231,6 +238,21 @@ mod tests {
         assert_eq!(f.pixel(1, 5), OUTLINE);
         assert_eq!(f.pixel(8, 5), OUTLINE);
         assert_eq!(f.pixel(0, 5), [0, 0, 0]);
+    }
+
+    #[test]
+    fn context_box_stays_on_the_monitor() {
+        let region = Region { x: 1080, y: 1350, width: 400, height: 30 };
+        // Bottom edge of a 2560x1440 monitor: clipped at y = 1440.
+        let c = context_box(region, 150, Some((0, 0, 2560, 1440)));
+        assert_eq!(c, Region { x: 930, y: 1200, width: 700, height: 240 });
+        // Second monitor to the right: never crosses into the first one.
+        let region = Region { x: 2600, y: 100, width: 50, height: 20 };
+        let c = context_box(region, 150, Some((2560, 0, 1920, 1080)));
+        assert_eq!((c.x, c.y), (2560, 0));
+        // Unknown monitor (grim backend): only clamped at 0.
+        let c = context_box(Region { x: 10, y: 10, width: 5, height: 5 }, 150, None);
+        assert_eq!(c, Region { x: 0, y: 0, width: 165, height: 165 });
     }
 
     #[test]

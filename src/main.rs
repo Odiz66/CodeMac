@@ -2,8 +2,8 @@
 //!
 //! You cast; when a fish bites you press the toggle key (a Hyprland bind that
 //! sends SIGUSR1), the macro reels via a uinput virtual device while watching a
-//! small screen region with grim, and stops by itself when the minigame is
-//! over. The kill-switch key (SIGUSR2) or Ctrl+C stops it at any time. Every
+//! small screen region (built-in wlr-screencopy client, or grim if
+//! configured), and stops by itself when the minigame is over. The kill-switch key (SIGUSR2) or Ctrl+C stops it at any time. Every
 //! held button is released on every exit path.
 
 mod calibrate;
@@ -208,7 +208,7 @@ fn countdown(secs: u64) -> bool {
     !signals::should_exit()
 }
 
-/// grim is only needed when it is (or may become) the capture backend.
+/// grim is only needed with `capture_backend = "grim"`.
 fn require_capture_tools(cfg: &Config) -> Result<(), String> {
     match cfg.capture_backend {
         CaptureBackend::Grim => require_tool("grim", "install it with `sudo pacman -S grim`"),

@@ -3,7 +3,7 @@ name = "fishmacro"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Wayland/Hyprland fishing-reel macro using uinput and grim"
+description = "Wayland/Hyprland fishing-reel macro using uinput and wlr-screencopy"
 license = "MIT"
 
 [dependencies]

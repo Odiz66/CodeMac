@@ -20,6 +20,12 @@ use crate::wayland::{Connection, DISPLAY_ID, Event, Message};
 
 /// How long one capture may take before giving up.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+/// The first capture on a connection may wait for a Hyprland permission
+/// prompt (with ecosystem:enforce_permissions); give the user time to answer.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
+const PROMPT_HINT_AFTER: Duration = Duration::from_secs(2);
+/// Waits are sliced so a cancel request is noticed quickly.
+const WAIT_SLICE: Duration = Duration::from_millis(50);
 /// Rate limit when the whole monitor has to be copied (scaled monitors).
 const FULL_OUTPUT_INTERVAL: Duration = Duration::from_millis(33);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -31,6 +37,7 @@ const WL_DISPLAY_EV_ERROR: u16 = 0;
 const WL_DISPLAY_EV_DELETE_ID: u16 = 1;
 const WL_REGISTRY_BIND: u16 = 0;
 const WL_REGISTRY_EV_GLOBAL: u16 = 0;
+const WL_REGISTRY_EV_GLOBAL_REMOVE: u16 = 1;
 const WL_CALLBACK_EV_DONE: u16 = 0;
 const WL_SHM_CREATE_POOL: u16 = 0;
 const WL_SHM_POOL_CREATE_BUFFER: u16 = 0;
@@ -74,6 +81,8 @@ const SHM_BGR888: u32 = fourcc(b"BG24");
 #[derive(Debug, Default)]
 struct Output {
     id: u32,
+    /// Registry name of the wl_output global (for global_remove).
+    global_name: u32,
     name: String,
     /// From zxdg_output_v1 (preferred): layout position and logical size.
     logical_position: Option<(i32, i32)>,
@@ -164,6 +173,10 @@ impl Drop for ShmBuffer {
 
 pub struct Screencopy {
     conn: Connection,
+    registry: u32,
+    /// A monitor was added or removed since connecting; reconnect to pick it up.
+    outputs_changed: bool,
+    frames_captured: u64,
     shm: u32,
     /// Formats wl_shm accepts; creating a buffer in any other is a fatal error.
     shm_formats: Vec<u32>,
@@ -217,7 +230,7 @@ impl Screencopy {
         let mut outputs = Vec::new();
         for (name, _, version) in globals.iter().filter(|g| g.1 == "wl_output") {
             let id = bind(&mut conn, registry, *name, "wl_output", (*version).min(4))?;
-            outputs.push(Output { id, scale: 1, ..Output::default() });
+            outputs.push(Output { id, global_name: *name, scale: 1, ..Output::default() });
         }
         let mut xdg_outputs = Vec::new();
         if let Some((name, version)) = find("zxdg_output_manager_v1") {
@@ -234,6 +247,9 @@ impl Screencopy {
 
         let mut sc = Screencopy {
             conn,
+            registry,
+            outputs_changed: false,
+            frames_captured: 0,
             shm,
             shm_formats: Vec::new(),
             manager,
@@ -264,11 +280,23 @@ impl Screencopy {
     }
 
     /// Captures `region` (layout coordinates) from the monitor that contains it.
-    pub fn grab(&mut self, region: &Region) -> Result<Frame, String> {
-        self.grab_inner(region).map_err(|e| format!("screencopy: {e}"))
+    /// `cancel` is polled while waiting; returning true aborts the capture.
+    pub fn grab(&mut self, region: &Region, cancel: &dyn Fn() -> bool) -> Result<Frame, String> {
+        self.grab_inner(region, cancel).map_err(|e| format!("screencopy: {e}"))
     }
 
-    fn grab_inner(&mut self, region: &Region) -> io::Result<Frame> {
+    /// Layout rectangle (x, y, width, height) of the monitor containing `region`.
+    pub fn monitor_rect(&self, region: &Region) -> Option<(i32, i32, i32, i32)> {
+        self.outputs.iter().map(Output::logical_rect).find(|&rect| contains(rect, region))
+    }
+
+    fn grab_inner(&mut self, region: &Region, cancel: &dyn Fn() -> bool) -> io::Result<Frame> {
+        // Handle anything that arrived while idle (e.g. a monitor unplug)
+        // before sending requests that could reference a dead wl_output.
+        self.dispatch_pending()?;
+        if self.outputs_changed {
+            return Err(io::Error::other("monitor setup changed; reconnecting"));
+        }
         let plan = self.plan(region)?;
         self.full_output = plan.region.is_none();
         if self.full_output && !self.warned_full_output {
@@ -294,7 +322,7 @@ impl Screencopy {
             }
         };
         self.conn.send(&request, None)?;
-        let result = self.copy_frame(frame, plan.crop);
+        let result = self.copy_frame(frame, plan.crop, cancel);
         // Always destroy the frame object, even after `failed`.
         let destroyed = self.conn.send(&Message::new(frame, FRAME_DESTROY), None);
         let frame = result?;
@@ -302,14 +330,16 @@ impl Screencopy {
         Ok(frame)
     }
 
-    fn copy_frame(&mut self, frame: u32, crop: Option<Rect>) -> io::Result<Frame> {
-        let deadline = Instant::now() + FRAME_TIMEOUT;
+    fn copy_frame(&mut self, frame: u32, crop: Option<Rect>, cancel: &dyn Fn() -> bool) -> io::Result<Frame> {
+        let first = self.frames_captured == 0;
+        let deadline = Instant::now() + if first { FIRST_FRAME_TIMEOUT } else { FRAME_TIMEOUT };
+        let mut hint_at = first.then(|| Instant::now() + PROMPT_HINT_AFTER);
 
         // 1. Buffer requirements. With v3 the list ends with buffer_done;
         //    before v3 the single `buffer` event is all there is.
         let mut spec = None;
         loop {
-            let ev = self.next_event(deadline)?;
+            let ev = self.wait_event(deadline, cancel, &mut hint_at)?;
             if ev.object != frame {
                 continue;
             }
@@ -337,7 +367,7 @@ impl Screencopy {
         // 3. Wait until the compositor has written the pixels.
         let mut y_invert = false;
         loop {
-            let ev = self.next_event(deadline)?;
+            let ev = self.wait_event(deadline, cancel, &mut hint_at)?;
             if ev.object != frame {
                 continue;
             }
@@ -358,6 +388,7 @@ impl Screencopy {
         };
         let buffer = self.buffer.as_ref().expect("buffer was just ensured");
         let rgb = to_rgb(buffer.pixels(), spec, crop, y_invert)?;
+        self.frames_captured += 1;
         Ok(Frame { width: crop.width as usize, height: crop.height as usize, rgb })
     }
 
@@ -378,14 +409,14 @@ impl Screencopy {
 
     /// Finds the output containing `region` and decides how to capture it.
     fn plan(&self, region: &Region) -> io::Result<Plan> {
-        let (rx, ry) = (region.x, region.y);
+        // Config limits keep these far inside i32.
         let (rw, rh) = (region.width as i32, region.height as i32);
         for output in &self.outputs {
             let (ox, oy, ow, oh) = output.logical_rect();
-            if !(rx >= ox && ry >= oy && rx + rw <= ox + ow && ry + rh <= oy + oh) {
+            if !contains((ox, oy, ow, oh), region) {
                 continue;
             }
-            let (lx, ly) = (rx - ox, ry - oy);
+            let (lx, ly) = (region.x - ox, region.y - oy);
             if output.transform != 0 {
                 return Err(io::Error::other(
                     "rotated/flipped monitors are not supported by the built-in capture; set capture_backend = \"grim\"",
@@ -470,8 +501,53 @@ impl Screencopy {
         Ok(id)
     }
 
+    /// Like `next_event`, but waits in short slices: aborts when `cancel`
+    /// returns true and prints a hint (once) if `hint_at` passes.
+    fn wait_event(
+        &mut self,
+        deadline: Instant,
+        cancel: &dyn Fn() -> bool,
+        hint_at: &mut Option<Instant>,
+    ) -> io::Result<Event> {
+        loop {
+            let slice_end = (Instant::now() + WAIT_SLICE).min(deadline);
+            match self.next_event(slice_end) {
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    if cancel() {
+                        return Err(io::Error::new(io::ErrorKind::Interrupted, "capture cancelled"));
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    if hint_at.is_some_and(|at| Instant::now() >= at) {
+                        *hint_at = None;
+                        eprintln!(
+                            "note: still waiting for Hyprland to deliver the first frame. If a screen-capture \
+                             permission prompt is open, allow it."
+                        );
+                    }
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Handles every event that has already arrived, without waiting.
+    fn dispatch_pending(&mut self) -> io::Result<()> {
+        while let Some(ev) = self.conn.poll_event()? {
+            if ev.object == DISPLAY_ID {
+                handle_display_event(&mut self.conn, &ev)?;
+            } else {
+                // Anything else left over (e.g. late events of a destroyed
+                // frame, wl_buffer.release) is irrelevant.
+                self.handle_output_event(&ev)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Next event, after handling the ones every object can get
-    /// (display errors, id deletion, output descriptions).
+    /// (display errors, id deletion, registry and output descriptions).
     fn next_event(&mut self, deadline: Instant) -> io::Result<Event> {
         loop {
             let ev = self.conn.next_event(deadline)?;
@@ -487,6 +563,25 @@ impl Screencopy {
     }
 
     fn handle_output_event(&mut self, ev: &Event) -> io::Result<bool> {
+        if ev.object == self.registry {
+            let mut r = ev.reader();
+            match ev.opcode {
+                WL_REGISTRY_EV_GLOBAL => {
+                    let _name = r.uint()?;
+                    if r.string()? == "wl_output" {
+                        self.outputs_changed = true;
+                    }
+                }
+                WL_REGISTRY_EV_GLOBAL_REMOVE => {
+                    let name = r.uint()?;
+                    if self.outputs.iter().any(|o| o.global_name == name) {
+                        self.outputs_changed = true;
+                    }
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
         if ev.object == self.shm {
             if ev.opcode == WL_SHM_EV_FORMAT {
                 self.shm_formats.push(ev.reader().uint()?);
@@ -589,6 +684,14 @@ fn bytes_per_pixel(format: u32) -> u32 {
         SHM_RGB888 | SHM_BGR888 => 3,
         _ => 4,
     }
+}
+
+/// Whether the layout rectangle (x, y, w, h) fully contains `region`.
+fn contains((x, y, w, h): (i32, i32, i32, i32), region: &Region) -> bool {
+    let (x, y, w, h) = (x as i64, y as i64, w as i64, h as i64);
+    let (rx, ry) = (region.x as i64, region.y as i64);
+    let (rw, rh) = (region.width as i64, region.height as i64);
+    rx >= x && ry >= y && rx + rw <= x + w && ry + rh <= y + h
 }
 
 /// The same layout without alpha.

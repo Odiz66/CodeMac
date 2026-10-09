@@ -102,11 +102,19 @@ impl Connection {
         }
     }
 
+    /// The next event if one is already available, without waiting.
+    pub fn poll_event(&mut self) -> io::Result<Option<Event>> {
+        if self.events.is_empty() {
+            self.fill(Duration::ZERO)?;
+        }
+        Ok(self.events.pop_front())
+    }
+
     /// Waits for readable data (up to `timeout`), reads it and decodes complete messages.
     fn fill(&mut self, timeout: Duration) -> io::Result<()> {
         let fd = self.socket.as_raw_fd();
         let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        let ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let ms = if timeout.is_zero() { 0 } else { timeout.as_millis().clamp(1, i32::MAX as u128) as i32 };
         // SAFETY: one valid pollfd.
         let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
         if ready < 0 {

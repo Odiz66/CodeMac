@@ -11,6 +11,10 @@ use std::time::Duration;
 
 use evdev::KeyCode;
 
+/// Bound for region coordinates and sizes (layout pixels), far beyond any
+/// real monitor layout but small enough that sums never overflow an i32.
+const MAX_COORD: i64 = 65_535;
+
 /// The commented example config, also written by `fishmacro init`.
 pub const EXAMPLE: &str = include_str!("../config.example.toml");
 
@@ -185,10 +189,10 @@ impl Config {
         let press_before_visible = r.bool("general.press_before_visible", false)?;
 
         let region = Region {
-            x: r.int("region.x", 1080)? as i32,
-            y: r.int("region.y", 1150)? as i32,
-            width: r.positive("region.width", 400)?,
-            height: r.positive("region.height", 30)?,
+            x: r.ranged("region.x", 1080, -MAX_COORD, MAX_COORD)? as i32,
+            y: r.ranged("region.y", 1150, -MAX_COORD, MAX_COORD)? as i32,
+            width: r.ranged("region.width", 400, 1, MAX_COORD)? as u32,
+            height: r.ranged("region.height", 30, 1, MAX_COORD)? as u32,
         };
 
         let capture_interval = r.millis("detect.capture_interval_ms", 0)?;
@@ -235,7 +239,7 @@ impl Config {
             other => return Err(format!("hyprland.config_format: unknown format `{other}` (use lua or legacy)")),
         };
 
-        let calibrate_margin = r.int("calibrate.context_margin", 150)?.max(0) as u32;
+        let calibrate_margin = r.ranged("calibrate.context_margin", 150, 0, MAX_COORD)? as u32;
 
         r.finish()?;
 
@@ -433,9 +437,9 @@ impl Reader {
         }
     }
 
-    fn positive(&mut self, key: &str, default: i64) -> Result<u32, String> {
+    fn ranged(&mut self, key: &str, default: i64, min: i64, max: i64) -> Result<i64, String> {
         let v = self.int(key, default)?;
-        u32::try_from(v).ok().filter(|v| *v > 0).ok_or_else(|| format!("`{key}` must be a positive integer"))
+        if (min..=max).contains(&v) { Ok(v) } else { Err(format!("`{key}` must be between {min} and {max}")) }
     }
 
     fn millis(&mut self, key: &str, default: i64) -> Result<Duration, String> {
@@ -524,6 +528,9 @@ mod tests {
         assert!(Config::parse("[general]\nmode = hold\n").is_err());
         assert!(Config::parse("[general]\nmode = \"hold\"\nmode = \"spam\"\n").is_err());
         assert!(Config::parse("[general]\nbutton = \"BTN_NOPE\"\n").is_err());
+        assert!(Config::parse(&format!("{base}[region]\nwidth = 3000000000\n")).is_err());
+        assert!(Config::parse(&format!("{base}[region]\nheight = 0\n")).is_err());
+        assert!(Config::parse(&format!("{base}[region]\nx = -5000000000\n")).is_err());
     }
 
     #[test]

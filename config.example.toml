@@ -53,11 +53,14 @@ height = 30
 # How the region is captured:
 #   "screencopy" - built-in wlr-screencopy client with one persistent
 #                  connection: one capture per monitor refresh (165/s on a
-#                  165 Hz monitor). The game's own fps (e.g. 240) doesn't
-#                  matter: only frames Hyprland actually shows can be captured.
+#                  165 Hz monitor). With vsync (Hyprland's default) the game's
+#                  own fps (e.g. 240) doesn't raise that: only frames Hyprland
+#                  composites can be captured. With tearing enabled, captures
+#                  can follow the game's fps.
 #   "grim"       - runs grim for every frame, ~50/s; needs `grim` installed.
-#                  Only for troubleshooting: Hyprland 0.56 may keep a capture
-#                  session around for every grim run.
+#                  Only for troubleshooting: grim copies the whole monitor
+#                  each time, and older grim (1.4) leaves a capture session
+#                  behind in Hyprland 0.56 for every run.
 capture_backend = "screencopy"
 
 # Minimum time between captures; 0 = as fast as the backend goes.
@@ -123,5 +126,6 @@ y = 720
 config_format = "lua"
 
 [calibrate]
-# Pixels of surroundings included in fishmacro-context.png.
+# Pixels of surroundings included in fishmacro-context.png (clipped to the
+# monitor the region is on).
 context_margin = 150

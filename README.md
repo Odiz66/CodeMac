@@ -27,16 +27,20 @@ Three reeling styles are supported (`mode` in the config):
   copies only the configured region. Each capture waits for the next frame
   Hyprland draws, so it runs at your **monitor refresh: up to 165 captures/s,
   about 6 ms each, on a 165 Hz screen**. Capture runs on its own thread.
-  - The game's frame rate (240 fps) doesn't raise that: only frames Hyprland
-    actually composites and shows can be captured, so 165 Hz is the ceiling.
-    It also doesn't hurt anything.
+  - The game's frame rate (240 fps) doesn't raise that with vsync, Hyprland's
+    default: only frames Hyprland actually composites can be captured, so
+    165/s is the ceiling. If you enabled tearing for the game, Hyprland
+    composites every game frame and captures can follow the game's fps
+    instead. The bar tracker works in real time, not per frame, so it behaves
+    the same either way.
   - The connection is opened once and reused for every catch. In Hyprland
     0.56 each capture client and region gets a capture session that is only
     freed when the monitor goes away, so reconnecting per catch would pile
     sessions up. With one connection there is exactly one.
   - `capture_backend = "grim"` runs grim per frame instead (about 50/s). It's
-    only for troubleshooting: grim copies the whole monitor for every frame,
-    and on Hyprland 0.56 each grim run leaves such a session behind.
+    only for troubleshooting: grim copies the whole monitor for every frame.
+    Older grim versions (1.4, which use wlr-screencopy) also leave a capture
+    session behind in Hyprland 0.56 for every run.
 - **Catch done**: the catch counts as done when the minigame's color has been
   gone from the region for `end_grace_ms`. It also counts as done right away if
   an optional "done" color shows up (a "Caught!" banner, for example).
@@ -237,22 +241,26 @@ click it once on your real mouse.
 - **The macro never stops**: `active_color` also matches when the minigame is
   closed. Lower `active_tolerance` or pick a more specific color.
 - **`watch` shows far fewer fps than your refresh rate**: check the `Capture:`
-  line. With the built-in client the fps should be close to your refresh rate
-  (Hyprland redraws for every capture request, even on a still screen). If it
+  line. With the built-in client the fps should be close to your refresh rate.
+  With vsync (the default) Hyprland redraws for every capture request, even on
+  a still screen. If it
   says "whole-monitor copy", your monitor scale isn't 1, so the macro copies the
   whole monitor at ~30/s. Hyprland 0.56 would otherwise create a new capture
   session for every frame. Set the monitor scale to 1 for full speed.
-- **Captures time out or show "Permission denied to share screen"**: you have
-  `ecosystem:enforce_permissions` enabled. Allow the binary, using its full
-  path (a regex, so `.` matches any character), then restart Hyprland:
+- **A permission prompt appears, or the region shows "Permission denied to
+  share screen"**: you have `ecosystem:enforce_permissions` enabled. The first
+  capture waits up to 60 s for you to answer, so choose Allow; the macro keeps
+  that one connection for the whole run. To avoid the prompt every time, allow
+  the binary by its full path (a regex, so `.` matches any character) and
+  restart Hyprland:
   ```lua
   hl.permission({ binary = "/home/you/.cargo/bin/fishmacro", type = "screencopy", mode = "allow" })
   ```
   Legacy config: `permission = /home/you/.cargo/bin/fishmacro, screencopy, allow`.
-  A pending permission prompt holds every capture until you answer it.
-- **The mouse cursor shows up in the region**: on NVIDIA with VRR or tearing,
-  Hyprland uses a software cursor that is part of every capture. Keep the
-  cursor away from the bar (most games hide it anyway).
+- **The mouse cursor shows up in the region**: with tearing (any GPU), on
+  NVIDIA with VRR, or with `cursor:no_hardware_cursors`, Hyprland draws a
+  software cursor that is part of every capture. Keep the cursor away from the
+  bar (most games hide it anyway).
 - **A "screen recording" indicator appears in your bar while reeling**:
   expected. Hyprland posts `screencast` events while something captures the
   screen, and turns them off 500 ms after the last capture.
