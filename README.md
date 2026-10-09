@@ -78,13 +78,14 @@ goes with it.
 ### Monitor refresh rate
 
 Every capture waits for the next screen refresh, so a faster monitor means
-fresher frames and better tracking. Your MSI G272QPF does 170 Hz; in the
-simulation a hard fish goes from ~98% to ~100% fish-in-bar when moving from
-60 Hz to 170 Hz. Check the offered modes, set it and verify:
+fresher frames and better tracking. Your MSI G272QPF offers up to 165 Hz
+(`2560x1440@164.99`); in the simulation a hard fish goes from ~98% to ~100%
+fish-in-bar when moving from 60 Hz to 170 Hz. Check the offered modes, set the
+highest one and verify:
 
 ```fish
 hyprctl monitors all | grep -i availablemodes
-echo 'hl.monitor({ output = "DP-3", mode = "2560x1440@170", position = "0x0", scale = 1 })' >> ~/.config/hypr/config/monitors.lua
+echo 'hl.monitor({ output = "DP-3", mode = "2560x1440@165", position = "0x0", scale = 1 })' >> ~/.config/hypr/config/monitors.lua
 hyprctl reload
 hyprctl monitors | grep @
 ```
