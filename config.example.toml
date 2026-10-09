@@ -50,7 +50,16 @@ width = 400
 height = 30
 
 [detect]
-# Minimum time between captures; 0 = as fast as grim can go (usually 30-60/s).
+# How the region is captured:
+#   "screencopy" - built-in wlr-screencopy client with one persistent
+#                  connection; one capture per monitor refresh (165/s on a
+#                  165 Hz monitor). The game's own fps (e.g. 240) doesn't
+#                  matter: only frames Hyprland actually shows can be captured.
+#   "grim"       - runs grim for every frame, ~50/s; needs `grim` installed.
+#   "auto"       - screencopy, falling back to grim if it doesn't work.
+capture_backend = "auto"
+
+# Minimum time between captures; 0 = as fast as the backend goes.
 capture_interval_ms = 0
 
 # A color that is in the region ONLY while the minigame is up (bar frame,
@@ -95,8 +104,9 @@ zone_min_pixels = 10
 # the zone instead of pushing it. Raise it if the zone jitters.
 deadband = 0.03
 # How far ahead (ms) to predict the marker. Raise it if the zone lags behind
-# a fast marker, lower it if it overshoots.
-lookahead_ms = 80
+# a fast marker, lower it if it overshoots. About 50 suits the native capture
+# at 165 Hz; with capture_backend = "grim" (slower, laggier) try ~80.
+lookahead_ms = 50
 
 [cursor]
 # Warp the cursor to (x, y) with hyprctl before reeling, for games that need

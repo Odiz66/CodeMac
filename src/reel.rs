@@ -56,7 +56,8 @@ pub fn reel(cfg: &Config, input: &mut VirtualInput) -> Result<Outcome, String> {
         // Let the game see the pointer at its new position before clicking.
         thread::sleep(Duration::from_millis(30));
     }
-    let capture = CaptureThread::start(cfg.region, Detector::from_config(cfg), cfg.capture_interval);
+    let capture =
+        CaptureThread::start(cfg.region, Detector::from_config(cfg), cfg.capture_interval, cfg.capture_backend);
     let result = run(cfg, input, &capture);
     let released = input.release_all();
     drop(capture);
@@ -208,8 +209,11 @@ pub struct Tracker {
     zone: Option<f32>,
 }
 
-/// Weight of the newest measurement in the velocity estimates.
-const SMOOTHING: f32 = 0.5;
+/// Time constant (seconds) of the velocity smoothing. Time-based rather than
+/// per-frame, so it behaves the same at 50 captures/s (grim) and at 165/s
+/// (native capture on a 165 Hz monitor), where per-frame pixel jitter is
+/// relatively larger.
+const VELOCITY_TAU: f32 = 0.03;
 
 impl Tracker {
     pub fn new(deadband: f32, lookahead: Duration) -> Tracker {
@@ -239,8 +243,9 @@ impl Tracker {
                 if dt > 0.001 {
                     let ev = (error - last_error) / dt;
                     let zv = (zone - last_zone) / dt;
-                    self.error_velocity = SMOOTHING * ev + (1.0 - SMOOTHING) * self.error_velocity;
-                    self.zone_velocity = SMOOTHING * zv + (1.0 - SMOOTHING) * self.zone_velocity;
+                    let alpha = 1.0 - (-dt / VELOCITY_TAU).exp();
+                    self.error_velocity += alpha * (ev - self.error_velocity);
+                    self.zone_velocity += alpha * (zv - self.zone_velocity);
                     self.last = Some((at, error, zone));
                 }
             }
@@ -289,7 +294,7 @@ mod tests {
         tracker.update(t0, &analysis(0.5, 0.52));
         assert_eq!(tracker.update(t0 + Duration::from_millis(20), &analysis(0.5, 0.50)), Some(true));
         // Zone rising: release.
-        assert_eq!(tracker.update(t0 + Duration::from_millis(40), &analysis(0.5, 0.51)), Some(false));
+        assert_eq!(tracker.update(t0 + Duration::from_millis(40), &analysis(0.5, 0.53)), Some(false));
     }
 
     #[test]
@@ -300,6 +305,24 @@ mod tests {
         // Marker moving up 1.0/s: right now it's only 0.02 ahead (inside the
         // deadband), but in 200 ms it will be well ahead, so hold.
         assert_eq!(tracker.update(t0 + Duration::from_millis(20), &analysis(0.52, 0.50)), Some(true));
+    }
+
+    #[test]
+    fn smoothing_does_not_depend_on_capture_rate() {
+        // Marker moving at a constant 0.5/s: after the same 120 ms the velocity
+        // estimate must be about the same whether sampled every 6 ms or 20 ms.
+        let estimate = |step_ms: u64| {
+            let t0 = Instant::now();
+            let mut tracker = Tracker::new(0.03, Duration::ZERO);
+            for i in 0..=(120 / step_ms) {
+                let t = i as f32 * step_ms as f32 / 1000.0;
+                tracker.update(t0 + Duration::from_millis(i * step_ms), &analysis(0.2 + 0.5 * t, 0.2));
+            }
+            tracker.error_velocity
+        };
+        let (fast, slow) = (estimate(6), estimate(20));
+        assert!((fast - slow).abs() < 0.03, "{fast} vs {slow}");
+        assert!(fast > 0.45 && fast < 0.51, "{fast}");
     }
 
     #[test]

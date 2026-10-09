@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
-use crate::capture::{self, CaptureThread, Frame};
+use crate::capture::{self, CaptureThread, Capturer, Frame};
 use crate::config::{ColorTarget, Config, Mode, Region};
 use crate::png;
 use crate::reel::Tracker;
@@ -19,7 +19,8 @@ const OUTLINE: [u8; 3] = [255, 0, 255];
 /// Captures the region once, saves screenshots and prints what the detector sees.
 pub fn calibrate(cfg: &Config, out_dir: &Path) -> Result<(), String> {
     let region = cfg.region;
-    let frame = capture::grab(&region)?;
+    let mut capturer = Capturer::new(cfg.capture_backend);
+    let frame = capturer.grab(&region)?;
 
     // Context: the region plus a margin around it, with the region outlined.
     let m = cfg.calibrate_margin as i32;
@@ -31,7 +32,7 @@ pub fn calibrate(cfg: &Config, out_dir: &Path) -> Result<(), String> {
         width: (region.x + region.width as i32 + m - cx) as u32,
         height: (region.y + region.height as i32 + m - cy) as u32,
     };
-    let mut context_frame = capture::grab(&context)?;
+    let mut context_frame = capturer.grab(&context)?;
     let scale = context_frame.width as f32 / context.width as f32;
     outline(
         &mut context_frame,
@@ -48,7 +49,13 @@ pub fn calibrate(cfg: &Config, out_dir: &Path) -> Result<(), String> {
     save(&region_path, &zoomed)?;
     save(&context_path, &context_frame)?;
 
-    println!("Region {} (layout px) -> captured {}x{} px", region.geometry(), frame.width, frame.height);
+    println!(
+        "Region {} (layout px) -> captured {}x{} px with {}",
+        region.geometry(),
+        frame.width,
+        frame.height,
+        capturer.describe()
+    );
     if frame.width != region.width as usize || frame.height != region.height as usize {
         println!("  note: monitor scale is not 1; detection works in captured pixels, that's fine");
     }
@@ -102,7 +109,9 @@ fn print_report(cfg: &Config, a: &Analysis) {
 
 /// Live detector output without sending input. Ends on Ctrl+C or the kill switch.
 pub fn watch(cfg: &Config) -> Result<(), String> {
-    let capture = CaptureThread::start(cfg.region, Detector::from_config(cfg), cfg.capture_interval);
+    println!("Capture: {}", capture::probe(cfg.capture_backend, &cfg.region)?);
+    let capture =
+        CaptureThread::start(cfg.region, Detector::from_config(cfg), cfg.capture_interval, cfg.capture_backend);
     let mut tracker = Tracker::new(cfg.track.deadband, cfg.track.lookahead);
     let mut frames = 0u32;
     let mut latency = Duration::ZERO;
@@ -132,7 +141,7 @@ pub fn watch(cfg: &Config) -> Result<(), String> {
                 let fps = frames as f32 / elapsed.as_secs_f32();
                 let grim_ms = latency.as_secs_f32() * 1000.0 / frames.max(1) as f32;
                 let mut line = format!(
-                    "{fps:5.1} fps  grim {grim_ms:4.1} ms  visible {:3}  done {:3}",
+                    "{fps:5.1} fps  capture {grim_ms:4.1} ms  visible {:3}  done {:3}",
                     yes_no(a.minigame_visible),
                     yes_no(a.catch_done)
                 );

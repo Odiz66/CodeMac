@@ -32,6 +32,17 @@ pub enum Axis {
     Vertical,
 }
 
+/// How the screen region is captured (`detect.capture_backend`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureBackend {
+    /// Native screencopy, falling back to grim if it does not work.
+    Auto,
+    /// Native wlr-screencopy client with a persistent connection.
+    Screencopy,
+    /// One `grim` process per frame.
+    Grim,
+}
+
 /// Which Hyprland config parser is active; it decides the `hyprctl dispatch` syntax.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HyprConfigFormat {
@@ -128,6 +139,7 @@ pub struct Config {
     pub region: Region,
 
     pub capture_interval: Duration,
+    pub capture_backend: CaptureBackend,
     pub active: Option<ColorTarget>,
     pub done: Option<ColorTarget>,
 
@@ -182,6 +194,16 @@ impl Config {
         };
 
         let capture_interval = r.millis("detect.capture_interval_ms", 0)?;
+        let capture_backend = match r.string("detect.capture_backend", "auto")?.as_str() {
+            "auto" => CaptureBackend::Auto,
+            "screencopy" => CaptureBackend::Screencopy,
+            "grim" => CaptureBackend::Grim,
+            other => {
+                return Err(format!(
+                    "detect.capture_backend: unknown backend `{other}` (use auto, screencopy or grim)"
+                ));
+            }
+        };
         let active = r.color_target("detect.active", 20)?;
         let done = r.color_target("detect.done", 20)?;
 
@@ -206,7 +228,7 @@ impl Config {
         if !(0.0..0.5).contains(&deadband) {
             return Err("track.deadband must be between 0.0 and 0.5".into());
         }
-        let lookahead = r.millis("track.lookahead_ms", 80)?;
+        let lookahead = r.millis("track.lookahead_ms", 50)?;
 
         let cursor_enabled = r.bool("cursor.enabled", false)?;
         let cursor_x = r.int("cursor.x", 1280)? as i32;
@@ -246,6 +268,7 @@ impl Config {
             press_before_visible,
             region,
             capture_interval,
+            capture_backend,
             active,
             done,
             spam: SpamConfig { clicks_per_second, press },

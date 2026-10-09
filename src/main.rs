@@ -13,15 +13,17 @@ mod hypr;
 mod input;
 mod png;
 mod reel;
+mod screencopy;
 mod signals;
 mod vision;
+mod wayland;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use config::{Config, Mode};
+use config::{CaptureBackend, Config, Mode};
 use input::VirtualInput;
 
 const USAGE: &str = "\
@@ -101,7 +103,7 @@ fn real_main() -> Result<(), String> {
         "run" => run(&Config::load(&args.config)?, args.dry_run),
         "calibrate" => {
             let cfg = Config::load(&args.config)?;
-            require_tool("grim", "install it with `sudo pacman -S grim`")?;
+            require_capture_tools(&cfg)?;
             println!("Bring up the reeling minigame in the game window.");
             if countdown(args.delay) {
                 let out_dir = std::env::current_dir().map_err(|e| e.to_string())?;
@@ -111,7 +113,7 @@ fn real_main() -> Result<(), String> {
         }
         "watch" => {
             let cfg = Config::load(&args.config)?;
-            require_tool("grim", "install it with `sudo pacman -S grim`")?;
+            require_capture_tools(&cfg)?;
             calibrate::watch(&cfg)
         }
         "test-input" => {
@@ -129,7 +131,7 @@ fn real_main() -> Result<(), String> {
 }
 
 fn run(cfg: &Config, dry_run: bool) -> Result<(), String> {
-    require_tool("grim", "install it with `sudo pacman -S grim`")?;
+    require_capture_tools(cfg)?;
     if cfg.cursor.is_some() {
         require_tool("hyprctl", "it ships with Hyprland; is this running inside Hyprland?")?;
     }
@@ -140,6 +142,7 @@ fn run(cfg: &Config, dry_run: bool) -> Result<(), String> {
         Mode::Track => "track".to_string(),
     };
     println!("fishmacro: mode {mode}, button {:?}, region {}", cfg.button, cfg.region.geometry());
+    println!("Capture: {}", capture::probe(cfg.capture_backend, &cfg.region)?);
 
     // Creating the device includes the settle delay (300 ms by default) so
     // the compositor has picked it up before the first event.
@@ -199,6 +202,14 @@ fn countdown(secs: u64) -> bool {
         }
     }
     !signals::should_exit()
+}
+
+/// grim is only needed when it is (or may become) the capture backend.
+fn require_capture_tools(cfg: &Config) -> Result<(), String> {
+    match cfg.capture_backend {
+        CaptureBackend::Grim => require_tool("grim", "install it with `sudo pacman -S grim`"),
+        CaptureBackend::Auto | CaptureBackend::Screencopy => Ok(()),
+    }
 }
 
 fn require_tool(name: &str, hint: &str) -> Result<(), String> {

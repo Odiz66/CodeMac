@@ -22,10 +22,17 @@ Three reeling styles are supported (`mode` in the config):
   compositor, so no X11 tools are involved. uinput sends *keycodes*: `KEY_E`
   means the key in the "E" position of a US layout. The macro waits 300 ms after
   creating the device before sending anything, so Hyprland has picked it up.
-- **Screen**: each frame is `grim -t ppm -g "x,y wxh" -`. grim uses the
-  wlr-screencopy protocol, which Hyprland supports, and copies only the
-  configured region. That gives roughly 30–60 captures per second, and capture
-  runs on its own thread.
+- **Screen**: a built-in wlr-screencopy client (Hyprland supports the
+  protocol) keeps one Wayland connection and one shared-memory buffer open, and
+  copies only the configured region. Each capture waits for the next frame
+  Hyprland draws, so it runs at your **monitor refresh: up to 165 captures/s,
+  about 6 ms each, on a 165 Hz screen**. Capture runs on its own thread.
+  - The game's frame rate (240 fps) doesn't raise that: only frames Hyprland
+    actually composites and shows can be captured, so 165 Hz is the ceiling.
+    It also doesn't hurt anything.
+  - `capture_backend = "grim"` runs `grim -t ppm -g "x,y wxh" -` per frame
+    instead (about 50/s). `"auto"`, the default, uses the built-in client and
+    falls back to grim if that fails.
 - **Catch done**: the catch counts as done when the minigame's color has been
   gone from the region for `end_grace_ms`. It also counts as done right away if
   an optional "done" color shows up (a "Caught!" banner, for example).
@@ -43,15 +50,15 @@ Three reeling styles are supported (`mode` in the config):
   macro never clicks after the catch, when a click would cast again in many
   games.
 
-Dependencies: `evdev` and `libc`. The config parser and the PNG writer used for
-calibration screenshots are built in.
+Dependencies: `evdev` and `libc`. The Wayland client, the config parser and the
+PNG writer for calibration screenshots are built in.
 
 ## 1. Install tools and build
 
 All commands are for the **fish** shell.
 
 ```fish
-sudo pacman -S --needed rust grim slurp
+sudo pacman -S --needed rust slurp grim    # grim: only for the fallback backend
 cd ~/path/to/CodeMac
 cargo build --release
 ```
@@ -223,8 +230,10 @@ click it once on your real mouse.
   with `fishmacro calibrate` / `watch` while the minigame is up.
 - **The macro never stops**: `active_color` also matches when the minigame is
   closed. Lower `active_tolerance` or pick a more specific color.
-- **Low fps in `watch`**: make the region smaller (a thin strip through the bar
-  is enough for `track`).
+- **`watch` shows far fewer fps than your refresh rate**: check the `Capture:`
+  line. If it says grim, the built-in client failed (the reason is printed just
+  above it). With the built-in client the fps should be close to your refresh
+  rate (Hyprland redraws for every capture request, even on a still screen).
 - **Cursor move fails**: `hyprctl` must run inside the Hyprland session
   (`HYPRLAND_INSTANCE_SIGNATURE` set), and `[hyprland] config_format` must match
   your config.
